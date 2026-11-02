@@ -1,0 +1,41 @@
+[package]
+name = "pyra_ocean_frontend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pyra_ocean_shared = { path = "../shared" }
+leptos = { version = "0.7", features = ["csr"] }
+leptos_meta = { version = "0.7" }
+leptos_router = { version = "0.7" }
+gloo-net = { version = "0.6", features = ["http", "websocket"] }
+gloo-storage = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "History",
+    "Document",
+    "Element",
+    "Event",
+    "SubmitEvent",
+    "DragEvent",
+    "DataTransfer",
+    "EventTarget",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "KeyboardEvent",
+    "MouseEvent",
+    "Blob",
+    "File",
+    "FileList",
+    "FormData",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
