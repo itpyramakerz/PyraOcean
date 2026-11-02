@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pyraocean-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pyraocean}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pyraocean_SuperSecret_2026!}
+      POSTGRES_DB: ${POSTGRES_DB:-pyraocean_db}
+    volumes:
+      - pyraocean_pgdata:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    networks:
+      - pyraocean_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pyraocean} -d ${POSTGRES_DB:-pyraocean_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pyraocean-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-pyraocean}:${POSTGRES_PASSWORD:-pyraocean_SuperSecret_2026!}@postgres:5432/${POSTGRES_DB:-pyraocean_db}
+      JWT_SECRET: ${JWT_SECRET:-replace_with_64_byte_cryptographic_secret_in_portainer_env}
+      PYRAOCEAN_SUPERADMIN_EMAIL: ${PYRAOCEAN_SUPERADMIN_EMAIL:-superadmin@pyraocean.local}
+      PYRAOCEAN_SUPERADMIN_PASSWORD: ${PYRAOCEAN_SUPERADMIN_PASSWORD:-PyraOcean#SuperAdmin2026!}
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8080
+      STORAGE_DIR: /data/pyraocean_uploads
+      RUST_LOG: pyra_ocean_backend=info,tower_http=info
+    ports:
+      - "${APP_EXTERNAL_PORT:-8080}:8080"
+    volumes:
+      - pyraocean_uploads:/data/pyraocean_uploads
+    networks:
+      - pyraocean_internal
+      - npm_proxy_net
+
+volumes:
+  pyraocean_pgdata:
+    driver: local
+  pyraocean_uploads:
+    driver: local
+
+networks:
+  pyraocean_internal:
+    driver: bridge
+  # Attachable network for Nginx Proxy Manager (NPM) in Portainer
+  npm_proxy_net:
+    driver: bridge

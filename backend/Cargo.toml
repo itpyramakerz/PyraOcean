@@ -1,0 +1,40 @@
+[package]
+name = "pyra_ocean_backend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pyra_ocean_shared = { path = "../shared", features = ["ssr"] }
+
+# Async Runtime & Web Framework
+tokio = { version = "1.43", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+headers = "0.4"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "limit"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+
+# Security & Auth
+jsonwebtoken = "9.3"
+argon2 = { version = "0.5", features = ["std"] }
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Data Ingestion & Import Engine (Notion & AppFlowy)
+csv = "1.3"
+pulldown-cmark = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Core Utilities & Observability
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+dotenvy = "0.15"
