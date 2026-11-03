@@ -12,7 +12,11 @@ use pyra_ocean_shared::SystemRole;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -45,6 +49,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run embedded SQL migrations automatically on startup
     sqlx::migrate!("../migrations").run(&db).await?;
 
+    // Ensure `grid_columns.width_px` defaults to 180px for interactive column resizing
+    sqlx::query("ALTER TABLE grid_columns ADD COLUMN IF NOT EXISTS width_px INT DEFAULT 180")
+        .execute(&db)
+        .await?;
+
+    // Ensure `grid_rows.position` exists for drag-and-drop row reordering
+    sqlx::query(
+        "ALTER TABLE grid_rows ADD COLUMN IF NOT EXISTS position INT NOT NULL DEFAULT 0",
+    )
+    .execute(&db)
+    .await?;
+
+    // Ensure `grid_history_snapshots` table exists for 30-Day Grid Version History & Point-in-Time Restore
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS grid_history_snapshots (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            grid_id UUID NOT NULL REFERENCES pages_grids(id) ON DELETE CASCADE,
+            action_type TEXT NOT NULL,
+            actor_user_id UUID,
+            actor_email TEXT,
+            snapshot_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_grid_history_snapshots_grid_created ON grid_history_snapshots (grid_id, created_at DESC)",
+    )
+    .execute(&db)
+    .await?;
+
+    // Purge any snapshots older than 30 days on startup
+    sqlx::query(
+        "DELETE FROM grid_history_snapshots WHERE created_at < NOW() - INTERVAL '30 days'",
+    )
+    .execute(&db)
+    .await?;
+
     // Seed singleton SuperAdmin account if none exists
     bootstrap_super_admin(&db).await?;
 
@@ -53,6 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret, 24)),
         uploads_dir: uploads_dir.clone(),
     };
+
+    // Serve `/public` and `/assets` from compiled Trunk `/app/dist/public` in Docker,
+    // automatically falling back to `frontend/public` during local development.
+    let public_service =
+        ServeDir::new("dist/public").fallback(ServeDir::new("frontend/public"));
+    let assets_service =
+        ServeDir::new("dist/public/assets").fallback(ServeDir::new("frontend/public/assets"));
 
     let app = Router::new()
         // Health & Branding
@@ -87,27 +140,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/spaces/{space_id}/members/{user_id}",
             delete(routes::spaces::revoke_space_member),
         )
-        // Module 2: Dynamic Grid Engine, Excel-Style Operations & Bulk Delete
+        // Module 2: Dynamic Grid Engine, Drag-and-Drop Reorder, Type Conversion & Bulk Delete
         .route(
             "/api/spaces/{space_id}/grids",
             get(routes::grids::list_space_grids).post(routes::grids::create_grid),
         )
-        .route("/api/grids/{grid_id}", get(routes::grids::get_grid_schema))
+        .route(
+            "/api/grids/{grid_id}",
+            get(routes::grids::get_grid_schema).patch(routes::grids::update_grid),
+        )
+        .route(
+            "/api/grids/{grid_id}/reset-layout",
+            post(routes::grids::reset_grid_layout),
+        )
+        .route(
+            "/api/grids/{grid_id}/history",
+            get(routes::grids::list_grid_history),
+        )
+        .route(
+            "/api/grids/{grid_id}/history/{history_id}/restore",
+            post(routes::grids::restore_grid_history),
+        )
         .route(
             "/api/grids/{grid_id}/columns",
             post(routes::grids::create_column),
         )
         .route(
+            "/api/grids/{grid_id}/columns/reorder",
+            patch(routes::grids::reorder_columns),
+        )
+        .route(
             "/api/grids/{grid_id}/columns/{col_id}",
-            patch(routes::grids::update_column),
+            patch(routes::grids::update_column).delete(routes::grids::delete_column),
         )
         .route(
             "/api/grids/{grid_id}/rows",
             get(routes::grids::list_rows).post(routes::grids::create_row),
         )
         .route(
+            "/api/grids/{grid_id}/rows/reorder",
+            patch(routes::grids::reorder_rows),
+        )
+        .route(
+            "/api/grids/{grid_id}/rows/restore",
+            post(routes::grids::restore_rows),
+        )
+        .route(
             "/api/grids/{grid_id}/rows/bulk",
             delete(routes::grids::bulk_delete_rows),
+        )
+        .route(
+            "/api/grids/{grid_id}/rows/bulk-cells",
+            patch(routes::grids::bulk_update_row_cells),
         )
         .route(
             "/api/grids/{grid_id}/rows/{row_id}",
@@ -122,10 +206,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/spaces/{space_id}/grids/import",
             post(services::importer::import_grid_handler),
         )
-        // Static file serving for uploaded cell attachments & brand logos
+        // Module 4: 3-Tier Scoped Search Engine (Current Grid, Space, All Spaces)
+        .route("/api/search", get(routes::search::search_handler))
+        // Static file serving for uploaded cell attachments, brand logos, and WASM SPA
         .nest_service("/uploads", ServeDir::new(uploads_dir))
-        .nest_service("/public", ServeDir::new("frontend/public"))
-        .nest_service("/assets", ServeDir::new("frontend/public/assets"))
+        .nest_service("/public", public_service)
+        .nest_service("/assets", assets_service)
+        .fallback_service(
+            ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html")),
+        )
         // Allow up to 50 MB multipart uploads for Notion/AppFlowy exports & cell attachments
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -199,6 +288,6 @@ async fn health_check(State(state): State<AppState>) -> Json<Value> {
             "powered_by": "Powered by Pyramakerz",
             "powered_by_logo": "/public/pyramakerz.webp"
         },
-        "phase": 3
+        "phase": 7
     }))
 }

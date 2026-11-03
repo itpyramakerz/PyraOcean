@@ -1,5 +1,6 @@
-use crate::auth::{
-    record_audit_log, resolve_space_access, AppState, AuthError, RequireSpaceAccess,
+use crate::{
+    auth::{record_audit_log, resolve_space_access, AppState, AuthError, RequireSpaceAccess},
+    routes::grids::record_grid_history_snapshot,
 };
 use axum::{
     extract::{Multipart, Path, State},
@@ -7,6 +8,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use flate2::read::ZlibDecoder;
 use pulldown_cmark::{Event, Parser};
 use pyra_ocean_shared::{
     CellValue, ChecklistItem, ColumnPropertyConfig, ColumnPropertyType, FileAttachment,
@@ -15,7 +17,10 @@ use pyra_ocean_shared::{
 };
 use serde_json::json;
 use sqlx::{Postgres, QueryBuilder};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::Read,
+};
 use uuid::Uuid;
 
 // ============================================================================
@@ -68,7 +73,7 @@ pub async fn import_grid_handler(
     let mut grid_title: Option<String> = None;
     let mut import_mode = ImportMode::FormattedSchemaInference;
     let mut filename = String::from("Imported Grid.csv");
-    let mut raw_content: Option<String> = None;
+    let mut raw_bytes: Option<Vec<u8>> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -106,17 +111,13 @@ pub async fn import_grid_handler(
                     .bytes()
                     .await
                     .map_err(|e| AuthError::BadRequest(format!("Failed to read upload: {e}")))?;
-                // Strip UTF-8 BOM if present (common in Excel/Notion CSV exports)
-                let text = String::from_utf8_lossy(&bytes)
-                    .trim_start_matches('\u{feff}')
-                    .to_string();
-                raw_content = Some(text);
+                raw_bytes = Some(bytes.to_vec());
             }
             _ => {}
         }
     }
 
-    let content = raw_content.ok_or_else(|| {
+    let file_bytes = raw_bytes.ok_or_else(|| {
         AuthError::BadRequest("Multipart request must include a 'file' field".into())
     })?;
 
@@ -129,7 +130,15 @@ pub async fn import_grid_handler(
             .to_string()
     });
 
-    let dataset = parse_tabular_input(&filename, &content)?;
+    let is_pdf = filename.to_lowercase().ends_with(".pdf") || file_bytes.starts_with(b"%PDF");
+    let dataset = if is_pdf {
+        parse_pdf_dataset(&file_bytes)?
+    } else {
+        let content = String::from_utf8_lossy(&file_bytes)
+            .trim_start_matches('\u{feff}')
+            .to_string();
+        parse_tabular_input(&filename, &content)?
+    };
     if dataset.headers.is_empty() {
         return Err(AuthError::BadRequest(
             "Uploaded file does not contain any recognizable columns".into(),
@@ -235,7 +244,7 @@ pub async fn import_grid_handler(
 
     // 3. Convert & Bulk Insert Rows using batched SQLx QueryBuilder
     let now = Utc::now();
-    let mut prepared_rows: Vec<(f64, RowCellMap)> = Vec::with_capacity(dataset.rows.len());
+    let mut prepared_rows: Vec<(i32, f64, RowCellMap)> = Vec::with_capacity(dataset.rows.len());
 
     for (row_idx, raw_row) in dataset.rows.iter().enumerate() {
         let mut cell_map: RowCellMap = HashMap::with_capacity(created_columns.len());
@@ -263,18 +272,20 @@ pub async fn import_grid_handler(
             cell_map.insert(col_schema.id, cell_val);
         }
 
+        let position = row_idx as i32;
         let row_order = ((row_idx + 1) as f64) * 1000.0;
-        prepared_rows.push((row_order, cell_map));
+        prepared_rows.push((position, row_order, cell_map));
     }
 
     // Batch insert in chunks of 500 rows to stay well within PostgreSQL bind parameter limits
     for chunk in prepared_rows.chunks(500) {
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-            "INSERT INTO grid_rows (grid_id, row_order, cells, created_by, updated_by) ",
+            "INSERT INTO grid_rows (grid_id, position, row_order, cells, created_by, updated_by) ",
         );
 
-        qb.push_values(chunk, |mut b, (row_order, cells)| {
+        qb.push_values(chunk, |mut b, (position, row_order, cells)| {
             b.push_bind(grid.id)
+                .push_bind(*position)
                 .push_bind(*row_order)
                 .push_bind(sqlx::types::Json(cells))
                 .push_bind(user.user_id)
@@ -303,6 +314,16 @@ pub async fn import_grid_handler(
         }),
     )
     .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid.id,
+        "grid.import",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Imported {imported_row_count} rows from '{filename}'"),
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -524,6 +545,274 @@ fn parse_markdown_table(content: &str) -> Result<ParsedDataset, AuthError> {
         rows,
         detected_delimiter: Some('|'),
     })
+}
+
+/// Pure-Rust PDF text & tabular stream extractor supporting both uncompressed PDF content streams
+/// and FlateDecode (`zlib`) compressed streams.
+///
+/// Extracts text lines from `BT ... ET` blocks (`Tj`, `TJ`, `'`, `"`), then detects tabular
+/// column alignments via pipe delimiters (`|`), tab characters (`\t`), or multi-space gaps (`2+` spaces).
+fn parse_pdf_dataset(pdf_bytes: &[u8]) -> Result<ParsedDataset, AuthError> {
+    let mut extracted_lines = extract_text_lines_from_pdf_streams(pdf_bytes);
+
+    // Fallback: if no `BT..ET` operators were matched, scan printable lines directly from the buffer
+    if extracted_lines.is_empty() {
+        let lossy = String::from_utf8_lossy(pdf_bytes);
+        for line in lossy.lines() {
+            let trimmed = line.trim();
+            if trimmed.len() >= 3
+                && !trimmed.starts_with('%')
+                && !trimmed.starts_with('/')
+                && !trimmed.starts_with("<<")
+                && !trimmed.starts_with(">>")
+                && !matches!(
+                    trimmed,
+                    "obj" | "endobj" | "stream" | "endstream" | "xref" | "trailer" | "startxref"
+                )
+                && !trimmed.ends_with(" obj")
+                && trimmed.chars().filter(|c| c.is_alphabetic()).count() >= 2
+            {
+                extracted_lines.push(trimmed.to_string());
+            }
+        }
+    }
+
+    let clean_lines: Vec<String> = extracted_lines
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if clean_lines.is_empty() {
+        return Err(AuthError::BadRequest(
+            "Could not extract any readable text or table rows from the uploaded PDF file.".into(),
+        ));
+    }
+
+    // Split each PDF line into columns using:
+    // 1. Pipe delimiter (`|`) if present
+    // 2. Tab character (`\t`) if present
+    // 3. Multi-space column alignment (`2+` consecutive spaces)
+    // 4. Comma (`,`) if present across lines
+    let mut split_rows: Vec<Vec<String>> = Vec::new();
+    let mut detected_delim: Option<char> = Some(' ');
+
+    for line in &clean_lines {
+        let cols: Vec<String> = if line.contains('|') {
+            detected_delim = Some('|');
+            line.trim_matches('|')
+                .split('|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else if line.contains('\t') {
+            detected_delim = Some('\t');
+            line.split('\t')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else if line.contains("  ") {
+            split_on_multi_spaces(line)
+        } else if line.contains(',') && line.split(',').count() >= 2 {
+            detected_delim = Some(',');
+            line.split(',').map(|s| s.trim().to_string()).collect()
+        } else {
+            vec![line.clone()]
+        };
+
+        if !cols.is_empty() {
+            split_rows.push(cols);
+        }
+    }
+
+    if split_rows.is_empty() {
+        return Err(AuthError::BadRequest(
+            "PDF file did not contain any valid table rows".into(),
+        ));
+    }
+
+    // Prefer multi-column rows (>= 2 columns) if the PDF has a title line followed by a table
+    let multi_col_rows: Vec<Vec<String>> = split_rows
+        .iter()
+        .filter(|r| r.len() >= 2)
+        .cloned()
+        .collect();
+
+    let effective_rows = if multi_col_rows.len() >= 2 {
+        multi_col_rows
+    } else {
+        split_rows
+    };
+
+    let headers = effective_rows[0].clone();
+    let rows: Vec<Vec<String>> = effective_rows.into_iter().skip(1).collect();
+
+    Ok(ParsedDataset {
+        headers,
+        rows,
+        detected_delimiter: detected_delim,
+    })
+}
+
+fn split_on_multi_spaces(line: &str) -> Vec<String> {
+    let mut cols = Vec::new();
+    let mut current = String::new();
+    let mut space_run = 0usize;
+
+    for ch in line.chars() {
+        if ch == ' ' {
+            space_run += 1;
+        } else {
+            if space_run >= 2 {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    cols.push(trimmed);
+                }
+                current.clear();
+            } else if space_run == 1 && !current.is_empty() {
+                current.push(' ');
+            }
+            space_run = 0;
+            current.push(ch);
+        }
+    }
+
+    let tail = current.trim().to_string();
+    if !tail.is_empty() {
+        cols.push(tail);
+    }
+    cols
+}
+
+fn extract_text_lines_from_pdf_streams(pdf_bytes: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(stream_pos) = find_subslice(&pdf_bytes[cursor..], b"stream") {
+        let abs_stream = cursor + stream_pos + 6;
+        let mut data_start = abs_stream;
+        if pdf_bytes.get(data_start) == Some(&b'\r') {
+            data_start += 1;
+        }
+        if pdf_bytes.get(data_start) == Some(&b'\n') {
+            data_start += 1;
+        }
+
+        let Some(end_offset) = find_subslice(&pdf_bytes[data_start..], b"endstream") else {
+            break;
+        };
+        let data_end = data_start + end_offset;
+        let raw_stream = &pdf_bytes[data_start..data_end];
+
+        // Attempt zlib/FlateDecode decompression first; fall back to raw stream bytes
+        let decoded_bytes = {
+            let trimmed_stream = trim_crlf(raw_stream);
+            let mut decoder = ZlibDecoder::new(trimmed_stream);
+            let mut decompressed = Vec::new();
+            if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
+                decompressed
+            } else {
+                trimmed_stream.to_vec()
+            }
+        };
+
+        let content_str = String::from_utf8_lossy(&decoded_bytes);
+        extract_bt_et_lines(&content_str, &mut lines);
+
+        cursor = data_end + 9;
+    }
+
+    // Also inspect top-level content in case the PDF stores unstreamed text operators
+    if lines.is_empty() {
+        let full_lossy = String::from_utf8_lossy(pdf_bytes);
+        extract_bt_et_lines(&full_lossy, &mut lines);
+    }
+
+    lines
+}
+
+fn trim_crlf(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.last(), Some(b'\r' | b'\n')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn extract_bt_et_lines(stream_text: &str, out_lines: &mut Vec<String>) {
+    let mut current_line = String::new();
+    let chars: Vec<char> = stream_text.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] == '(' {
+            // Parse PDF literal string `(...)` with escape handling
+            i += 1;
+            let mut depth = 1usize;
+            let mut token = String::new();
+            while i < chars.len() && depth > 0 {
+                let c = chars[i];
+                if c == '\\' && i + 1 < chars.len() {
+                    i += 1;
+                    match chars[i] {
+                        'n' => token.push('\n'),
+                        'r' => token.push('\r'),
+                        't' => token.push('\t'),
+                        other => token.push(other),
+                    }
+                } else if c == '(' {
+                    depth += 1;
+                    token.push(c);
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth > 0 {
+                        token.push(c);
+                    }
+                } else {
+                    token.push(c);
+                }
+                i += 1;
+            }
+            if !token.is_empty() {
+                if !current_line.is_empty() && !current_line.ends_with(' ') {
+                    current_line.push_str("  ");
+                }
+                current_line.push_str(&token);
+            }
+        } else if chars[i] == 'T' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            // `Td`, `TD`, `T*` move to a new text line in PDF coordinate space
+            if matches!(next, 'd' | 'D' | '*') {
+                let trimmed = current_line.trim().to_string();
+                if !trimmed.is_empty() {
+                    out_lines.push(trimmed);
+                }
+                current_line.clear();
+                i += 2;
+                continue;
+            }
+            i += 1;
+        } else if chars[i] == 'E' && i + 1 < chars.len() && chars[i + 1] == 'T' {
+            let trimmed = current_line.trim().to_string();
+            if !trimmed.is_empty() {
+                out_lines.push(trimmed);
+            }
+            current_line.clear();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let trimmed = current_line.trim().to_string();
+    if !trimmed.is_empty() {
+        out_lines.push(trimmed);
+    }
 }
 
 // ============================================================================

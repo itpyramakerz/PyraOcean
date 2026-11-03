@@ -9,7 +9,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-pyraocean_db}
     volumes:
       - pyraocean_pgdata:/var/lib/postgresql/data
-      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      # - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
     networks:
       - pyraocean_internal
     healthcheck:
@@ -38,8 +38,10 @@ services:
       RUST_LOG: pyra_ocean_backend=info,tower_http=info
     ports:
       - "${APP_EXTERNAL_PORT:-8080}:8080"
+      - "5432:5432"
     volumes:
       - pyraocean_uploads:/data/pyraocean_uploads
+      - ./frontend/dist:/app/dist:ro
     networks:
       - pyraocean_internal
       - npm_proxy_net

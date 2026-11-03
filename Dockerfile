@@ -1,13 +1,13 @@
 # ============================================================================
 # Stage 1: Rust Backend & WASM Frontend Builder
 # ============================================================================
-FROM rust:1.84-bookworm AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /usr/src/pyra_ocean
 
 # Install WASM target & Trunk for Leptos CSR build
 RUN rustup target add wasm32-unknown-unknown && \
-    cargo install trunk --locked
+    curl -L https://github.com/trunk-rs/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf - -C /usr/local/bin
 
 # Copy workspace manifests and source code
 COPY Cargo.toml ./
@@ -32,7 +32,7 @@ WORKDIR /app
 
 COPY --from=builder /usr/src/pyra_ocean/target/release/pyra_ocean_backend /app/pyra_ocean_backend
 COPY --from=builder /usr/src/pyra_ocean/migrations /app/migrations
-COPY --from=builder /usr/src/pyra_ocean/frontend/public/assets /app/frontend/public/assets
+COPY --from=builder /usr/src/pyra_ocean/frontend/public /app/frontend/public
 
 # Create persistent attachment volume directory for `Files` property cells
 RUN mkdir -p /data/pyraocean_uploads

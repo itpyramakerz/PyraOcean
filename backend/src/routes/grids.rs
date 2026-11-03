@@ -7,19 +7,34 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use chrono::Utc;
+use chrono::{NaiveDate, NaiveTime, Utc};
 use pyra_ocean_shared::{
-    BulkDeleteRowsRequest, BulkDeleteRowsResponse, CellValue, ColumnPropertyConfig,
-    ColumnPropertyType, CreateColumnRequest, CreateGridRequest, CreateRowRequest, FileAttachment,
-    FilterOperator, GridColumn, GridRow, GridSchemaResponse, PageGrid, PatchRowRequest, RowCellMap,
-    SortDirection, UpdateColumnRequest,
+    BulkDeleteRowsRequest, BulkDeleteRowsResponse, BulkPatchCellsRequest, CellValue, ChecklistItem,
+    ColumnPropertyConfig, ColumnPropertyType, CreateColumnRequest, CreateGridRequest,
+    CreateRowRequest, FileAttachment, FilterOperator, GridColumn, GridHistoryEntry, GridRow,
+    GridSchemaResponse, GridSnapshotData, PageGrid, PatchRowRequest, ReorderColumnsRequest,
+    ReorderRowsRequest, RestoreGridHistoryResponse, RestoreRowsRequest, RowCellMap, SelectOption,
+    SortDirection, TagColor, UpdateColumnRequest, UpdateGridRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::{Postgres, QueryBuilder};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
+
+const CONVERT_TAG_PALETTE: [TagColor; 10] = [
+    TagColor::Blue,
+    TagColor::Emerald,
+    TagColor::Amber,
+    TagColor::Violet,
+    TagColor::Rose,
+    TagColor::Cyan,
+    TagColor::Orange,
+    TagColor::Indigo,
+    TagColor::Teal,
+    TagColor::Pink,
+];
 
 // ============================================================================
 // 1. Query Parameters for Grid Rows
@@ -222,6 +237,77 @@ pub async fn get_grid_schema(
     Ok(Json(GridSchemaResponse { grid, columns }))
 }
 
+/// `PATCH /api/grids/{grid_id}`
+/// Renames a Grid Page or updates its description/icon (`CanEdit` / `SpaceAdmin` / `SuperAdmin`).
+pub async fn update_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(payload): Json<UpdateGridRequest>,
+) -> Result<Json<PageGrid>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let existing: PageGrid = sqlx::query_as(
+        r#"
+        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        FROM pages_grids
+        WHERE id = $1 AND is_archived = FALSE
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("Grid {grid_id} not found")))?;
+
+    let new_title = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&existing.title)
+        .to_string();
+
+    let new_description = match payload.description {
+        Some(desc) => Some(desc),
+        None => existing.description.clone(),
+    };
+    let new_icon = match payload.icon {
+        Some(ic) => Some(ic),
+        None => existing.icon.clone(),
+    };
+
+    let updated: PageGrid = sqlx::query_as(
+        r#"
+        UPDATE pages_grids
+        SET title = $2,
+            description = $3,
+            icon = $4,
+            updated_at = NOW()
+        WHERE id = $1 AND is_archived = FALSE
+        RETURNING id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        "#,
+    )
+    .bind(grid_id)
+    .bind(&new_title)
+    .bind(&new_description)
+    .bind(&new_icon)
+    .fetch_one(&state.db)
+    .await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.rename",
+        json!({ "old_title": existing.title, "new_title": updated.title }),
+    )
+    .await?;
+
+    Ok(Json(updated))
+}
+
 /// `POST /api/grids/{grid_id}/columns`
 pub async fn create_column(
     State(state): State<AppState>,
@@ -240,7 +326,7 @@ pub async fn create_column(
         .property_config
         .unwrap_or_else(|| default_config_for_type(payload.property_type));
 
-    let width_px = payload.width_px.unwrap_or(180).clamp(60, 1200);
+    let width_px = payload.width_px.unwrap_or(180).clamp(80, 800);
 
     let next_pos: (i32,) = sqlx::query_as(
         "SELECT COALESCE(MAX(position) + 1, 0) FROM grid_columns WHERE grid_id = $1",
@@ -278,10 +364,73 @@ pub async fn create_column(
     )
     .await?;
 
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "column.create",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Added column '{}' ({:?})", column.name, column.property_type),
+    )
+    .await;
+
     Ok((StatusCode::CREATED, Json(column)))
 }
 
+/// `PATCH /api/grids/{grid_id}/columns/reorder`
+/// Atomically updates `position` for all columns in a Grid after drag-and-drop or Move Left/Right.
+pub async fn reorder_columns(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(payload): Json<ReorderColumnsRequest>,
+) -> Result<Json<Vec<GridColumn>>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let mut tx = state.db.begin().await?;
+
+    for (idx, col_id) in payload.column_ids.iter().enumerate() {
+        sqlx::query(
+            "UPDATE grid_columns SET position = $3 WHERE id = $1 AND grid_id = $2",
+        )
+        .bind(col_id)
+        .bind(grid_id)
+        .bind(idx as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let columns: Vec<GridColumn> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+        FROM grid_columns
+        WHERE grid_id = $1
+        ORDER BY position ASC, created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.columns.reorder",
+        json!({ "column_ids": payload.column_ids }),
+    )
+    .await?;
+
+    Ok(Json(columns))
+}
+
 /// `PATCH /api/grids/{grid_id}/columns/{col_id}`
+/// Updates column name, width, position, select options, or converts `property_type` while safely
+/// casting existing cell values in `grid_rows.cells` (`JSONB`) without data loss.
 pub async fn update_column(
     State(state): State<AppState>,
     RequireSpaceAccess(user): RequireSpaceAccess,
@@ -290,6 +439,8 @@ pub async fn update_column(
 ) -> Result<Json<GridColumn>, AuthError> {
     let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
     access.ensure_write()?;
+
+    let mut tx = state.db.begin().await?;
 
     let existing: GridColumn = sqlx::query_as(
         r#"
@@ -300,7 +451,7 @@ pub async fn update_column(
     )
     .bind(col_id)
     .bind(grid_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AuthError::NotFound(format!("Column {col_id} not found in grid {grid_id}")))?;
 
@@ -311,22 +462,172 @@ pub async fn update_column(
         .filter(|s| !s.is_empty())
         .unwrap_or(&existing.name)
         .to_string();
-    let new_config = payload.property_config.unwrap_or(existing.property_config);
+
+    let target_type = payload.property_type.unwrap_or(existing.property_type);
+    let type_changed = target_type != existing.property_type;
+
+    let mut new_config = match payload.property_config {
+        Some(cfg) => cfg,
+        None if type_changed => default_config_for_type(target_type),
+        None => existing.property_config.clone(),
+    };
+
     let new_width = payload
         .width_px
         .unwrap_or(existing.width_px)
-        .clamp(60, 1200);
+        .clamp(80, 800);
     let new_position = payload.position.unwrap_or(existing.position);
     let new_hidden = payload.is_hidden.unwrap_or(existing.is_hidden);
+
+    // If the column's `property_type` was changed, safely convert existing cells in `grid_rows`
+    if type_changed {
+        let mut rows: Vec<GridRow> = sqlx::query_as(
+            r#"
+            SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            FROM grid_rows
+            WHERE grid_id = $1
+            ORDER BY position ASC, row_order ASC, created_at ASC
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Extract human-readable string representations of each row's existing cell value
+        let mut extracted_strings: HashMap<Uuid, String> = HashMap::new();
+        for row in &rows {
+            if let Some(old_val) = row.cells.get(&col_id) {
+                let s = cell_to_convertible_string(old_val, &existing.property_config);
+                if !s.trim().is_empty() {
+                    extracted_strings.insert(row.id, s);
+                }
+            }
+        }
+
+        // Auto-build `SelectOption` tags if converting into `Select` or `MultiSelect`
+        if matches!(target_type, ColumnPropertyType::Select | ColumnPropertyType::MultiSelect) {
+            let mut labels: BTreeMap<String, SelectOption> = BTreeMap::new();
+            for text in extracted_strings.values() {
+                if target_type == ColumnPropertyType::MultiSelect {
+                    for token in text.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                        let idx = labels.len();
+                        labels
+                            .entry(token.to_string())
+                            .or_insert_with(|| SelectOption {
+                                id: Uuid::new_v4(),
+                                label: token.to_string(),
+                                color: CONVERT_TAG_PALETTE[idx % CONVERT_TAG_PALETTE.len()],
+                            });
+                    }
+                } else {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        let idx = labels.len();
+                        labels
+                            .entry(trimmed.to_string())
+                            .or_insert_with(|| SelectOption {
+                                id: Uuid::new_v4(),
+                                label: trimmed.to_string(),
+                                color: CONVERT_TAG_PALETTE[idx % CONVERT_TAG_PALETTE.len()],
+                            });
+                    }
+                }
+            }
+
+            let generated_opts: Vec<SelectOption> = labels.into_values().collect();
+            new_config = if target_type == ColumnPropertyType::Select {
+                ColumnPropertyConfig::Select {
+                    options: generated_opts,
+                }
+            } else {
+                ColumnPropertyConfig::MultiSelect {
+                    options: generated_opts,
+                }
+            };
+        }
+
+        let now = Utc::now();
+        for row in &mut rows {
+            if let Some(raw_str) = extracted_strings.get(&row.id) {
+                let converted =
+                    convert_string_to_cell(raw_str, target_type, &new_config, user.user_id, now);
+                row.cells.insert(col_id, converted);
+            } else if target_type == ColumnPropertyType::LastModified {
+                row.cells
+                    .insert(col_id, CellValue::LastModified(row.last_modified));
+            } else {
+                row.cells.remove(&col_id);
+            }
+
+            sqlx::query("UPDATE grid_rows SET cells = $2 WHERE id = $1")
+                .bind(row.id)
+                .bind(sqlx::types::Json(&row.cells))
+                .execute(&mut *tx)
+                .await?;
+        }
+    } else if matches!(
+        target_type,
+        ColumnPropertyType::Select | ColumnPropertyType::MultiSelect
+    ) {
+        // If `Select` or `MultiSelect` option tags were deleted, clean removed option IDs from existing cells
+        let valid_ids: std::collections::HashSet<Uuid> = match &new_config {
+            ColumnPropertyConfig::Select { options }
+            | ColumnPropertyConfig::MultiSelect { options } => {
+                options.iter().map(|o| o.id).collect()
+            }
+            _ => std::collections::HashSet::new(),
+        };
+
+        let mut rows: Vec<GridRow> = sqlx::query_as(
+            r#"
+            SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            FROM grid_rows
+            WHERE grid_id = $1
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for row in &mut rows {
+            let mut modified = false;
+            if let Some(cell) = row.cells.get_mut(&col_id) {
+                match cell {
+                    CellValue::Select(Some(oid)) => {
+                        if !valid_ids.contains(oid) {
+                            *cell = CellValue::Select(None);
+                            modified = true;
+                        }
+                    }
+                    CellValue::MultiSelect(oids) => {
+                        let before = oids.len();
+                        oids.retain(|id| valid_ids.contains(id));
+                        if oids.len() != before {
+                            modified = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if modified {
+                sqlx::query("UPDATE grid_rows SET cells = $2 WHERE id = $1")
+                    .bind(row.id)
+                    .bind(sqlx::types::Json(&row.cells))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
 
     let updated: GridColumn = sqlx::query_as(
         r#"
         UPDATE grid_columns
         SET name = $3,
-            property_config = $4,
-            width_px = $5,
-            position = $6,
-            is_hidden = $7
+            property_type = $4,
+            property_config = $5,
+            width_px = $6,
+            position = $7,
+            is_hidden = $8
         WHERE id = $1 AND grid_id = $2
         RETURNING id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
         "#,
@@ -334,14 +635,284 @@ pub async fn update_column(
     .bind(col_id)
     .bind(grid_id)
     .bind(&new_name)
+    .bind(target_type)
     .bind(sqlx::types::Json(new_config))
     .bind(new_width)
     .bind(new_position)
     .bind(new_hidden)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
 
+    tx.commit().await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.column.update",
+        json!({
+            "column_id": col_id,
+            "name": updated.name,
+            "property_type": updated.property_type,
+            "type_changed": type_changed
+        }),
+    )
+    .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "column.update",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Updated column '{}' ({:?})", updated.name, updated.property_type),
+    )
+    .await;
+
     Ok(Json(updated))
+}
+
+/// `DELETE /api/grids/{grid_id}/columns/{col_id}`
+/// Removes a column from `grid_columns` and strips its key from `grid_rows.cells` (`cells = cells - $1`).
+pub async fn delete_column(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((grid_id, col_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let mut tx = state.db.begin().await?;
+
+    let deleted = sqlx::query("DELETE FROM grid_columns WHERE id = $1 AND grid_id = $2")
+        .bind(col_id)
+        .bind(grid_id)
+        .execute(&mut *tx)
+        .await?;
+
+    if deleted.rows_affected() == 0 {
+        return Err(AuthError::NotFound(format!(
+            "Column {col_id} not found in grid {grid_id}"
+        )));
+    }
+
+    // Strip the deleted column's UUID key from all rows in this grid
+    sqlx::query("UPDATE grid_rows SET cells = cells - $1 WHERE grid_id = $2")
+        .bind(col_id.to_string())
+        .bind(grid_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.column.delete",
+        json!({ "deleted_column_id": col_id }),
+    )
+    .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "column.delete",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Deleted column {col_id}"),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn cell_to_convertible_string(val: &CellValue, old_cfg: &ColumnPropertyConfig) -> String {
+    match val {
+        CellValue::Text(s) => s.clone(),
+        CellValue::Number(n) => n.to_string(),
+        CellValue::Select(Some(oid)) => {
+            if let ColumnPropertyConfig::Select { options } = old_cfg {
+                if let Some(opt) = options.iter().find(|o| &o.id == oid) {
+                    return opt.label.clone();
+                }
+            }
+            oid.to_string()
+        }
+        CellValue::Select(None) => String::new(),
+        CellValue::MultiSelect(oids) => {
+            if let ColumnPropertyConfig::MultiSelect { options } = old_cfg {
+                let labels: Vec<String> = oids
+                    .iter()
+                    .filter_map(|id| options.iter().find(|o| &o.id == id).map(|o| o.label.clone()))
+                    .collect();
+                if !labels.is_empty() {
+                    return labels.join(", ");
+                }
+            }
+            String::new()
+        }
+        CellValue::Date(Some(d)) => d.format("%Y-%m-%d").to_string(),
+        CellValue::Date(None) => String::new(),
+        CellValue::Time {
+            time_of_day: Some(t),
+            ..
+        } => t.format("%H:%M").to_string(),
+        CellValue::Time { .. } => String::new(),
+        CellValue::Files(files) => files
+            .iter()
+            .map(|f| f.storage_url.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
+        CellValue::Checkbox(b) => b.to_string(),
+        CellValue::Checklist(items) => items
+            .iter()
+            .map(|i| {
+                if i.completed {
+                    format!("[x] {}", i.item)
+                } else {
+                    format!("[ ] {}", i.item)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        CellValue::LastModified(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        CellValue::Person(uids) => uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+fn convert_string_to_cell(
+    raw: &str,
+    target_type: ColumnPropertyType,
+    target_cfg: &ColumnPropertyConfig,
+    actor_id: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> CellValue {
+    let trimmed = raw.trim();
+    match target_type {
+        ColumnPropertyType::Text => CellValue::Text(trimmed.to_string()),
+        ColumnPropertyType::Number => {
+            let cleaned: String = trimmed
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                .collect();
+            let n = cleaned.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+            CellValue::Number(n)
+        }
+        ColumnPropertyType::Select => {
+            if let ColumnPropertyConfig::Select { options } = target_cfg {
+                let first_token = trimmed.split(',').next().unwrap_or("").trim();
+                let found = options
+                    .iter()
+                    .find(|o| o.label.eq_ignore_ascii_case(first_token))
+                    .map(|o| o.id);
+                CellValue::Select(found)
+            } else {
+                CellValue::Select(None)
+            }
+        }
+        ColumnPropertyType::MultiSelect => {
+            if let ColumnPropertyConfig::MultiSelect { options } = target_cfg {
+                let ids = trimmed
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .filter_map(|tok| {
+                        options
+                            .iter()
+                            .find(|o| o.label.eq_ignore_ascii_case(tok))
+                            .map(|o| o.id)
+                    })
+                    .collect();
+                CellValue::MultiSelect(ids)
+            } else {
+                CellValue::MultiSelect(Vec::new())
+            }
+        }
+        ColumnPropertyType::Date => {
+            let d = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+                .or_else(|_| NaiveDate::parse_from_str(trimmed, "%d/%m/%Y"))
+                .ok();
+            CellValue::Date(d)
+        }
+        ColumnPropertyType::Time => {
+            let t = NaiveTime::parse_from_str(trimmed, "%H:%M:%S")
+                .or_else(|_| NaiveTime::parse_from_str(trimmed, "%H:%M"))
+                .ok();
+            CellValue::Time {
+                time_of_day: t,
+                duration_seconds: None,
+            }
+        }
+        ColumnPropertyType::Checkbox => {
+            let b = matches!(
+                trimmed.to_lowercase().as_str(),
+                "true" | "1" | "yes" | "[x]" | "checked"
+            );
+            CellValue::Checkbox(b)
+        }
+        ColumnPropertyType::Checklist => {
+            let items = trimmed
+                .lines()
+                .flat_map(|l| l.split(','))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|part| {
+                    if let Some(rest) = part.strip_prefix("[x]").or_else(|| part.strip_prefix("[X]")) {
+                        ChecklistItem {
+                            id: Uuid::new_v4(),
+                            item: rest.trim().to_string(),
+                            completed: true,
+                        }
+                    } else if let Some(rest) = part.strip_prefix("[ ]") {
+                        ChecklistItem {
+                            id: Uuid::new_v4(),
+                            item: rest.trim().to_string(),
+                            completed: false,
+                        }
+                    } else {
+                        ChecklistItem {
+                            id: Uuid::new_v4(),
+                            item: part.to_string(),
+                            completed: false,
+                        }
+                    }
+                })
+                .collect();
+            CellValue::Checklist(items)
+        }
+        ColumnPropertyType::Files => {
+            let files = trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(|url| FileAttachment {
+                    id: Uuid::new_v4(),
+                    filename: url.rsplit('/').next().unwrap_or("file").to_string(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 0,
+                    storage_url: url.to_string(),
+                    uploaded_by: actor_id,
+                    uploaded_at: now,
+                })
+                .collect();
+            CellValue::Files(files)
+        }
+        ColumnPropertyType::Person => {
+            let uids = trimmed
+                .split(',')
+                .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+                .collect();
+            CellValue::Person(uids)
+        }
+        ColumnPropertyType::LastModified => CellValue::LastModified(now),
+    }
 }
 
 // ============================================================================
@@ -370,7 +941,7 @@ pub async fn list_rows(
     let col_map: HashMap<Uuid, GridColumn> = columns.into_iter().map(|c| (c.id, c)).collect();
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT id, grid_id, row_order, cells, created_by, updated_by, created_at, last_modified FROM grid_rows WHERE grid_id = ",
+        "SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified FROM grid_rows WHERE grid_id = ",
     );
     qb.push_bind(grid_id);
 
@@ -519,9 +1090,9 @@ pub async fn list_rows(
     }
 
     if pushed_sort {
-        qb.push(", row_order ASC, id ASC");
+        qb.push(", position ASC, row_order ASC, created_at ASC, id ASC");
     } else {
-        qb.push("row_order ASC, id ASC");
+        qb.push("position ASC, row_order ASC, created_at ASC, id ASC");
     }
 
     let limit = query.limit.unwrap_or(200).clamp(1, 2000);
@@ -584,32 +1155,39 @@ pub async fn create_row(
 
     validate_and_stamp_cells(&state.db, grid_id, &mut payload.cells).await?;
 
-    let row_order = match payload.row_order {
-        Some(ord) => ord,
-        None => {
-            let max_ord: (f64,) = sqlx::query_as(
-                "SELECT COALESCE(MAX(row_order) + 1000.0, 1000.0) FROM grid_rows WHERE grid_id = $1",
-            )
-            .bind(grid_id)
-            .fetch_one(&state.db)
-            .await?;
-            max_ord.0
-        }
-    };
+    let (next_pos, max_ord): (i32, f64) = sqlx::query_as(
+        "SELECT COALESCE(MAX(position) + 1, 0), COALESCE(MAX(row_order) + 1000.0, 1000.0) FROM grid_rows WHERE grid_id = $1",
+    )
+    .bind(grid_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    let row_order = payload.row_order.unwrap_or(max_ord);
 
     let row: GridRow = sqlx::query_as(
         r#"
-        INSERT INTO grid_rows (grid_id, row_order, cells, created_by, updated_by)
-        VALUES ($1, $2, $3, $4, $4)
-        RETURNING id, grid_id, row_order, cells, created_by, updated_by, created_at, last_modified
+        INSERT INTO grid_rows (grid_id, position, row_order, cells, created_by, updated_by)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        RETURNING id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
         "#,
     )
     .bind(grid_id)
+    .bind(next_pos)
     .bind(row_order)
     .bind(sqlx::types::Json(&payload.cells))
     .bind(user.user_id)
     .fetch_one(&state.db)
     .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "row.create",
+        Some(user.user_id),
+        Some(&user.email),
+        "Created new row",
+    )
+    .await;
 
     Ok((StatusCode::CREATED, Json(row)))
 }
@@ -633,7 +1211,7 @@ pub async fn update_row(
             updated_by = $5,
             last_modified = NOW()
         WHERE id = $1 AND grid_id = $2
-        RETURNING id, grid_id, row_order, cells, created_by, updated_by, created_at, last_modified
+        RETURNING id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
         "#,
     )
     .bind(row_id)
@@ -645,7 +1223,88 @@ pub async fn update_row(
     .await?
     .ok_or_else(|| AuthError::NotFound(format!("Row {row_id} not found in grid {grid_id}")))?;
 
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "row.update",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Edited row {row_id}"),
+    )
+    .await;
+
     Ok(Json(updated))
+}
+
+/// `PATCH /api/grids/{grid_id}/rows/bulk-cells`
+/// Batch-updates cell values across multiple rows in a single PostgreSQL transaction
+/// (used by Excel Fill-Handle drag-to-copy).
+pub async fn bulk_update_row_cells(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(mut payload): Json<BulkPatchCellsRequest>,
+) -> Result<Json<Vec<GridRow>>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    if payload.updates.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    for item in &mut payload.updates {
+        validate_and_stamp_cells(&state.db, grid_id, &mut item.cells).await?;
+    }
+
+    let mut tx = state.db.begin().await?;
+    let mut updated_rows = Vec::with_capacity(payload.updates.len());
+
+    for item in payload.updates {
+        let updated: Option<GridRow> = sqlx::query_as(
+            r#"
+            UPDATE grid_rows
+            SET cells = cells || $3::jsonb,
+                updated_by = $4,
+                last_modified = NOW()
+            WHERE id = $1 AND grid_id = $2
+            RETURNING id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            "#,
+        )
+        .bind(item.row_id)
+        .bind(grid_id)
+        .bind(sqlx::types::Json(&item.cells))
+        .bind(user.user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(r) = updated {
+            updated_rows.push(r);
+        }
+    }
+
+    tx.commit().await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.rows.bulk_fill_cells",
+        json!({ "updated_count": updated_rows.len() }),
+    )
+    .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "rows.bulk_fill",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Bulk-filled cells across {} rows", updated_rows.len()),
+    )
+    .await;
+
+    Ok(Json(updated_rows))
 }
 
 pub async fn bulk_delete_rows(
@@ -681,7 +1340,405 @@ pub async fn bulk_delete_rows(
     )
     .await?;
 
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "rows.bulk_delete",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Deleted {deleted_count} row(s)"),
+    )
+    .await;
+
     Ok(Json(BulkDeleteRowsResponse { deleted_count }))
+}
+
+/// `PATCH /api/grids/{grid_id}/rows/reorder`
+/// Atomically updates `position` and `row_order` for all rows in a Grid after drag-and-drop row rearranging.
+pub async fn reorder_rows(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(payload): Json<ReorderRowsRequest>,
+) -> Result<Json<Vec<GridRow>>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let mut tx = state.db.begin().await?;
+
+    for (idx, row_id) in payload.row_ids.iter().enumerate() {
+        let pos = idx as i32;
+        let ord = ((idx + 1) as f64) * 1000.0;
+        sqlx::query(
+            "UPDATE grid_rows SET position = $3, row_order = $4 WHERE id = $1 AND grid_id = $2",
+        )
+        .bind(row_id)
+        .bind(grid_id)
+        .bind(pos)
+        .bind(ord)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let rows: Vec<GridRow> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+        FROM grid_rows
+        WHERE grid_id = $1
+        ORDER BY position ASC, row_order ASC, created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.rows.reorder",
+        json!({ "row_count": payload.row_ids.len() }),
+    )
+    .await?;
+
+    Ok(Json(rows))
+}
+
+/// `POST /api/grids/{grid_id}/rows/restore`
+/// Restores previously deleted `GridRow`s (used by the `Ctrl+Z` Multi-Step Undo Engine).
+pub async fn restore_rows(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(payload): Json<RestoreRowsRequest>,
+) -> Result<Json<Vec<GridRow>>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let mut tx = state.db.begin().await?;
+
+    for row in &payload.rows {
+        sqlx::query(
+            r#"
+            INSERT INTO grid_rows (id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (id) DO UPDATE SET
+                position = EXCLUDED.position,
+                row_order = EXCLUDED.row_order,
+                cells = EXCLUDED.cells,
+                updated_by = EXCLUDED.updated_by
+            "#,
+        )
+        .bind(row.id)
+        .bind(grid_id)
+        .bind(row.position)
+        .bind(row.row_order)
+        .bind(sqlx::types::Json(&row.cells))
+        .bind(row.created_by)
+        .bind(user.user_id)
+        .bind(row.created_at)
+        .bind(row.last_modified)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let rows: Vec<GridRow> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+        FROM grid_rows
+        WHERE grid_id = $1
+        ORDER BY position ASC, row_order ASC, created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "rows.restore_undo",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Restored {} deleted row(s) via Undo", payload.rows.len()),
+    )
+    .await;
+
+    Ok(Json(rows))
+}
+
+/// `POST /api/grids/{grid_id}/reset-layout`
+/// Resets all column widths in a Grid back to their default `180px` and returns the updated columns.
+pub async fn reset_grid_layout(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+) -> Result<Json<Vec<GridColumn>>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let columns: Vec<GridColumn> = sqlx::query_as(
+        r#"
+        UPDATE grid_columns
+        SET width_px = 180
+        WHERE grid_id = $1
+        RETURNING id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut sorted = columns;
+    sorted.sort_by_key(|c| (c.position, c.created_at));
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.reset_layout",
+        json!({ "default_width_px": 180 }),
+    )
+    .await?;
+
+    Ok(Json(sorted))
+}
+
+/// Records a point-in-time snapshot into `grid_history_snapshots` and purges snapshots older than 30 days.
+pub async fn record_grid_history_snapshot(
+    db: &sqlx::PgPool,
+    grid_id: Uuid,
+    action_type: &str,
+    actor_user_id: Option<Uuid>,
+    actor_email: Option<&str>,
+    summary: &str,
+) -> Result<(), AuthError> {
+    let columns: Vec<GridColumn> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+        FROM grid_columns
+        WHERE grid_id = $1
+        ORDER BY position ASC, created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(db)
+    .await?;
+
+    let rows: Vec<GridRow> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+        FROM grid_rows
+        WHERE grid_id = $1
+        ORDER BY position ASC, row_order ASC, created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(db)
+    .await?;
+
+    let snapshot = GridSnapshotData {
+        columns,
+        rows,
+        summary: summary.to_string(),
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO grid_history_snapshots (grid_id, action_type, actor_user_id, actor_email, snapshot_data)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(grid_id)
+    .bind(action_type)
+    .bind(actor_user_id)
+    .bind(actor_email)
+    .bind(sqlx::types::Json(&snapshot))
+    .execute(db)
+    .await?;
+
+    // Automatic 30-day retention cleanup
+    sqlx::query(
+        "DELETE FROM grid_history_snapshots WHERE created_at < NOW() - INTERVAL '30 days'",
+    )
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+/// `GET /api/grids/{grid_id}/history`
+/// Returns the last 30 days of `GridHistoryEntry` snapshots for a Grid.
+pub async fn list_grid_history(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+) -> Result<Json<Vec<GridHistoryEntry>>, AuthError> {
+    let _access = resolve_grid_access(&state.db, user, grid_id).await?;
+
+    // Purge expired snapshots older than 30 days
+    let _ = sqlx::query(
+        "DELETE FROM grid_history_snapshots WHERE created_at < NOW() - INTERVAL '30 days'",
+    )
+    .execute(&state.db)
+    .await;
+
+    let entries: Vec<GridHistoryEntry> = sqlx::query_as(
+        r#"
+        SELECT
+            id,
+            grid_id,
+            action_type,
+            actor_user_id,
+            actor_email,
+            COALESCE(snapshot_data ->> 'summary', action_type) AS summary,
+            COALESCE(jsonb_array_length(snapshot_data -> 'columns'), 0)::int AS column_count,
+            COALESCE(jsonb_array_length(snapshot_data -> 'rows'), 0)::int AS row_count,
+            created_at
+        FROM grid_history_snapshots
+        WHERE grid_id = $1
+          AND created_at >= NOW() - INTERVAL '30 days'
+        ORDER BY created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(entries))
+}
+
+/// `POST /api/grids/{grid_id}/history/{history_id}/restore`
+/// Restores a Grid's columns and rows to an exact historical point-in-time snapshot.
+pub async fn restore_grid_history(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((grid_id, history_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RestoreGridHistoryResponse>, AuthError> {
+    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let row_opt: Option<(sqlx::types::Json<GridSnapshotData>,)> = sqlx::query_as(
+        "SELECT snapshot_data FROM grid_history_snapshots WHERE id = $1 AND grid_id = $2",
+    )
+    .bind(history_id)
+    .bind(grid_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (sqlx::types::Json(snapshot),) = row_opt.ok_or_else(|| {
+        AuthError::NotFound(format!("History snapshot {history_id} not found for grid {grid_id}"))
+    })?;
+
+    let mut tx = state.db.begin().await?;
+
+    let grid: PageGrid = sqlx::query_as(
+        r#"
+        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        FROM pages_grids
+        WHERE id = $1 AND is_archived = FALSE
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("Grid {grid_id} not found")))?;
+
+    sqlx::query("DELETE FROM grid_rows WHERE grid_id = $1")
+        .bind(grid_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM grid_columns WHERE grid_id = $1")
+        .bind(grid_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let mut restored_columns = Vec::with_capacity(snapshot.columns.len());
+    for col in &snapshot.columns {
+        let inserted_col: GridColumn = sqlx::query_as(
+            r#"
+            INSERT INTO grid_columns (
+                id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            RETURNING id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+            "#,
+        )
+        .bind(col.id)
+        .bind(grid_id)
+        .bind(&col.name)
+        .bind(col.property_type)
+        .bind(sqlx::types::Json(&col.property_config))
+        .bind(col.width_px.clamp(80, 800))
+        .bind(col.position)
+        .bind(col.is_primary)
+        .bind(col.is_hidden)
+        .bind(col.created_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        restored_columns.push(inserted_col);
+    }
+
+    let mut restored_rows = Vec::with_capacity(snapshot.rows.len());
+    for r in &snapshot.rows {
+        let inserted_row: GridRow = sqlx::query_as(
+            r#"
+            INSERT INTO grid_rows (
+                id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            "#,
+        )
+        .bind(r.id)
+        .bind(grid_id)
+        .bind(r.position)
+        .bind(r.row_order)
+        .bind(sqlx::types::Json(&r.cells))
+        .bind(r.created_by)
+        .bind(user.user_id)
+        .bind(r.created_at)
+        .bind(r.last_modified)
+        .fetch_one(&mut *tx)
+        .await?;
+        restored_rows.push(inserted_row);
+    }
+
+    tx.commit().await?;
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.history.restore",
+        json!({ "history_id": history_id, "columns": restored_columns.len(), "rows": restored_rows.len() }),
+    )
+    .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "history.restore",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Restored version snapshot {history_id}"),
+    )
+    .await;
+
+    Ok(Json(RestoreGridHistoryResponse {
+        grid,
+        columns: restored_columns,
+        rows: restored_rows,
+    }))
 }
 
 pub async fn upload_cell_file(
@@ -795,7 +1852,7 @@ pub async fn upload_cell_file(
 
     let mut row: GridRow = sqlx::query_as(
         r#"
-        SELECT id, grid_id, row_order, cells, created_by, updated_by, created_at, last_modified
+        SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
         FROM grid_rows
         WHERE id = $1 AND grid_id = $2
         "#,
@@ -826,7 +1883,7 @@ pub async fn upload_cell_file(
             updated_by = $4,
             last_modified = NOW()
         WHERE id = $1 AND grid_id = $2
-        RETURNING id, grid_id, row_order, cells, created_by, updated_by, created_at, last_modified
+        RETURNING id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
         "#,
     )
     .bind(row_id)
@@ -835,6 +1892,16 @@ pub async fn upload_cell_file(
     .bind(user.user_id)
     .fetch_one(&state.db)
     .await?;
+
+    let _ = record_grid_history_snapshot(
+        &state.db,
+        grid_id,
+        "row.upload_file",
+        Some(user.user_id),
+        Some(&user.email),
+        &format!("Uploaded file attachment to row {row_id}"),
+    )
+    .await;
 
     Ok(Json(updated_row))
 }
