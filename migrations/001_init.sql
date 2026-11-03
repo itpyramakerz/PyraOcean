@@ -162,6 +162,7 @@ CREATE INDEX idx_grid_columns_config_gin ON grid_columns USING GIN (property_con
 CREATE TABLE grid_rows (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     grid_id         UUID NOT NULL REFERENCES pages_grids(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL DEFAULT 0,
     -- Fractional indexing float for O(1) row reordering without renumbering the entire table
     row_order       DOUBLE PRECISION NOT NULL DEFAULT 1000.0,
     -- Dynamic cell map keyed by column UUID -> {"t": "<property_type>", "v": <typed_value>}
@@ -173,7 +174,20 @@ CREATE TABLE grid_rows (
 );
 
 -- B-Tree composite index for fast pagination and default ordering within a grid
-CREATE INDEX idx_grid_rows_grid_order ON grid_rows (grid_id, row_order ASC, id ASC);
+CREATE INDEX idx_grid_rows_grid_order ON grid_rows (grid_id, position ASC, row_order ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS grid_history_snapshots (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    grid_id         UUID NOT NULL REFERENCES pages_grids(id) ON DELETE CASCADE,
+    action_type     TEXT NOT NULL,
+    actor_user_id   UUID,
+    actor_email     TEXT,
+    snapshot_data   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_grid_history_snapshots_grid_created
+    ON grid_history_snapshots (grid_id, created_at DESC);
 
 -- B-Tree index for sorting/filtering by LastModified property
 CREATE INDEX idx_grid_rows_last_modified ON grid_rows (grid_id, last_modified DESC);

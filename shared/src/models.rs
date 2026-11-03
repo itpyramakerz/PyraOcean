@@ -487,6 +487,9 @@ pub type RowCellMap = HashMap<Uuid, CellValue>;
 pub struct GridRow {
     pub id: Uuid,
     pub grid_id: Uuid,
+    #[serde(default)]
+    #[cfg_attr(feature = "ssr", sqlx(default))]
+    pub position: i32,
     pub row_order: f64,
     #[cfg_attr(feature = "ssr", sqlx(json))]
     pub cells: RowCellMap,
@@ -616,6 +619,16 @@ pub struct CreateGridRequest {
     pub position: Option<i32>,
 }
 
+/// Request payload for `PATCH /api/grids/{grid_id}` to rename a Grid Page or update its description.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateGridRequest {
+    /// Accepts `"name"` or `"title"` from JSON callers.
+    #[serde(alias = "title")]
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridSchemaResponse {
     pub grid: PageGrid,
@@ -635,10 +648,47 @@ pub struct CreateColumnRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateColumnRequest {
     pub name: Option<String>,
+    pub property_type: Option<ColumnPropertyType>,
     pub property_config: Option<ColumnPropertyConfig>,
     pub width_px: Option<i32>,
     pub position: Option<i32>,
     pub is_hidden: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorderColumnsRequest {
+    pub column_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    Grid,
+    Space,
+    All,
+}
+
+impl SearchScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchScope::Grid => "grid",
+            SearchScope::Space => "space",
+            SearchScope::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ssr", derive(FromRow))]
+pub struct SearchHit {
+    pub space_id: Uuid,
+    pub space_name: String,
+    pub grid_id: Uuid,
+    pub grid_title: String,
+    pub row_id: Option<Uuid>,
+    pub match_type: String,
+    pub snippet: String,
+    pub last_modified: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,6 +701,61 @@ pub struct CreateRowRequest {
 pub struct PatchRowRequest {
     pub row_order: Option<f64>,
     pub cells: RowCellMap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkRowCellPatch {
+    pub row_id: Uuid,
+    pub cells: RowCellMap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkPatchCellsRequest {
+    pub updates: Vec<BulkRowCellPatch>,
+}
+
+/// Request payload for `PATCH /api/grids/{grid_id}/rows/reorder`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorderRowsRequest {
+    pub row_ids: Vec<Uuid>,
+}
+
+/// Request payload for `POST /api/grids/{grid_id}/rows/restore` (Undo deleted rows).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreRowsRequest {
+    pub rows: Vec<GridRow>,
+}
+
+/// Full JSONB snapshot stored in `grid_history_snapshots.snapshot_data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridSnapshotData {
+    pub columns: Vec<GridColumn>,
+    pub rows: Vec<GridRow>,
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// Summary entry returned by `GET /api/grids/{grid_id}/history` (30-Day Grid History).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ssr", derive(FromRow))]
+pub struct GridHistoryEntry {
+    pub id: Uuid,
+    pub grid_id: Uuid,
+    pub action_type: String,
+    pub actor_user_id: Option<Uuid>,
+    pub actor_email: Option<String>,
+    pub summary: String,
+    pub column_count: i32,
+    pub row_count: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Response returned by `POST /api/grids/{grid_id}/history/{history_id}/restore`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreGridHistoryResponse {
+    pub grid: PageGrid,
+    pub columns: Vec<GridColumn>,
+    pub rows: Vec<GridRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
