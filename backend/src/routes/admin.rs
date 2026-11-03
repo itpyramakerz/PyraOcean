@@ -155,6 +155,11 @@ pub async fn create_user(
     .fetch_one(&state.db)
     .await?;
 
+    state.cache.set_user_status(
+        created_user.id,
+        (created_user.system_role, created_user.is_active),
+    );
+
     record_audit_log(
         &state.db,
         admin.user_id,
@@ -203,6 +208,8 @@ pub async fn update_user_role(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AuthError::NotFound(format!("User {target_user_id} not found")))?;
+
+    state.cache.invalidate_user(&target_user_id);
 
     record_audit_log(
         &state.db,

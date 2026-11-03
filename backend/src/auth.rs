@@ -11,21 +11,235 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use pyra_ocean_shared::{SpaceRole, SystemRole};
+use pyra_ocean_shared::{GridColumn, GridSchemaResponse, PageGrid, SpaceRole, SystemRole};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::{Duration as StdDuration, Instant},
+};
 use uuid::Uuid;
 
 // ============================================================================
-// 1. Application State & Auth Configuration
+// 1. Application State, In-Memory Hot-Path Cache & Auth Configuration
 // ============================================================================
+
+const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
+
+struct CacheEntry<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+/// High-speed in-memory TTL cache eliminating repetitive PostgreSQL roundtrips on hot paths:
+/// - `user_status`: `(SystemRole, bool)` for `AuthUser` JWT extractor verification
+/// - `space_access`: `SpaceRole` for `(user_id, space_id)` RBAC resolution
+/// - `grid_space`: `space_id` for `grid_id` lookup
+/// - `grid_access`: `SpaceRole` for `(user_id, grid_id)` RBAC resolution
+/// - `grid_schema`: `(PageGrid, Vec<GridColumn>)` for `get_grid_schema` and cell validation
+#[derive(Default)]
+pub struct AppCache {
+    user_status: RwLock<HashMap<Uuid, CacheEntry<(SystemRole, bool)>>>,
+    space_access: RwLock<HashMap<(Uuid, Uuid), CacheEntry<SpaceRole>>>,
+    grid_space: RwLock<HashMap<Uuid, CacheEntry<Uuid>>>,
+    grid_access: RwLock<HashMap<(Uuid, Uuid), CacheEntry<SpaceRole>>>,
+    grid_schema: RwLock<HashMap<Uuid, CacheEntry<GridSchemaResponse>>>,
+    space_grids: RwLock<HashMap<Uuid, CacheEntry<Vec<PageGrid>>>>,
+}
+
+impl AppCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_user_status(&self, user_id: &Uuid) -> Option<(SystemRole, bool)> {
+        let guard = self.user_status.read().ok()?;
+        let entry = guard.get(user_id)?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_user_status(&self, user_id: Uuid, status: (SystemRole, bool)) {
+        if let Ok(mut guard) = self.user_status.write() {
+            guard.insert(
+                user_id,
+                CacheEntry {
+                    value: status,
+                    expires_at: Instant::now() + CACHE_TTL,
+                },
+            );
+        }
+    }
+
+    pub fn invalidate_user(&self, user_id: &Uuid) {
+        if let Ok(mut guard) = self.user_status.write() {
+            guard.remove(user_id);
+        }
+        if let Ok(mut guard) = self.space_access.write() {
+            guard.retain(|(uid, _), _| uid != user_id);
+        }
+        if let Ok(mut guard) = self.grid_access.write() {
+            guard.retain(|(uid, _), _| uid != user_id);
+        }
+    }
+
+    pub fn get_space_access(&self, user_id: Uuid, space_id: Uuid) -> Option<SpaceRole> {
+        let guard = self.space_access.read().ok()?;
+        let entry = guard.get(&(user_id, space_id))?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_space_access(&self, user_id: Uuid, space_id: Uuid, role: SpaceRole) {
+        if let Ok(mut guard) = self.space_access.write() {
+            guard.insert(
+                (user_id, space_id),
+                CacheEntry {
+                    value: role,
+                    expires_at: Instant::now() + CACHE_TTL,
+                },
+            );
+        }
+    }
+
+    pub fn invalidate_space(&self, space_id: &Uuid) {
+        if let Ok(mut guard) = self.space_access.write() {
+            guard.retain(|(_, sid), _| sid != space_id);
+        }
+        if let Ok(mut guard) = self.grid_access.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.space_grids.write() {
+            guard.remove(space_id);
+        }
+    }
+
+    pub fn get_grid_space(&self, grid_id: &Uuid) -> Option<Uuid> {
+        let guard = self.grid_space.read().ok()?;
+        let entry = guard.get(grid_id)?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_grid_space(&self, grid_id: Uuid, space_id: Uuid) {
+        if let Ok(mut guard) = self.grid_space.write() {
+            guard.insert(
+                grid_id,
+                CacheEntry {
+                    value: space_id,
+                    expires_at: Instant::now() + CACHE_TTL,
+                },
+            );
+        }
+    }
+
+    pub fn get_grid_access(&self, user_id: Uuid, grid_id: Uuid) -> Option<SpaceRole> {
+        let guard = self.grid_access.read().ok()?;
+        let entry = guard.get(&(user_id, grid_id))?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_grid_access(&self, user_id: Uuid, grid_id: Uuid, role: SpaceRole) {
+        if let Ok(mut guard) = self.grid_access.write() {
+            guard.insert(
+                (user_id, grid_id),
+                CacheEntry {
+                    value: role,
+                    expires_at: Instant::now() + CACHE_TTL,
+                },
+            );
+        }
+    }
+
+    pub fn get_grid_schema(&self, grid_id: &Uuid) -> Option<GridSchemaResponse> {
+        let guard = self.grid_schema.read().ok()?;
+        let entry = guard.get(grid_id)?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.value.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn get_grid_columns(&self, grid_id: &Uuid) -> Option<Vec<GridColumn>> {
+        self.get_grid_schema(grid_id).map(|s| s.columns)
+    }
+
+    pub fn set_grid_schema(&self, grid_id: Uuid, schema: GridSchemaResponse) {
+        self.set_grid_space(grid_id, schema.grid.space_id);
+        if let Ok(mut guard) = self.grid_schema.write() {
+            guard.insert(
+                grid_id,
+                CacheEntry {
+                    value: schema,
+                    expires_at: Instant::now() + CACHE_TTL,
+                },
+            );
+        }
+    }
+
+    pub fn invalidate_grid(&self, grid_id: &Uuid) {
+        let maybe_sid = self.get_grid_space(grid_id);
+        if let Ok(mut guard) = self.grid_schema.write() {
+            guard.remove(grid_id);
+        }
+        if let Ok(mut guard) = self.grid_space.write() {
+            guard.remove(grid_id);
+        }
+        if let Ok(mut guard) = self.grid_access.write() {
+            guard.retain(|(_, gid), _| gid != grid_id);
+        }
+        if let Some(sid) = maybe_sid {
+            if let Ok(mut guard) = self.space_grids.write() {
+                guard.remove(&sid);
+            }
+        }
+    }
+
+    pub fn get_space_grids(&self, space_id: &Uuid) -> Option<Vec<PageGrid>> {
+        let guard = self.space_grids.read().ok()?;
+        let entry = guard.get(space_id)?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.value.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn set_space_grids(&self, space_id: Uuid, grids: Vec<PageGrid>) {
+        if let Ok(mut guard) = self.space_grids.write() {
+            guard.insert(
+                space_id,
+                CacheEntry {
+                    value: grids,
+                    expires_at: Instant::now() + CACHE_TTL,
+                },
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub jwt_config: Arc<JwtConfig>,
     pub uploads_dir: PathBuf,
+    pub cache: Arc<AppCache>,
 }
 
 pub struct JwtConfig {
@@ -136,7 +350,9 @@ pub enum AuthError {
 impl From<sqlx::Error> for AuthError {
     fn from(err: sqlx::Error) -> Self {
         match err {
-            sqlx::Error::RowNotFound => AuthError::NotFound("Requested database record not found".into()),
+            sqlx::Error::RowNotFound => {
+                AuthError::NotFound("Requested database record not found".into())
+            }
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
                 AuthError::Conflict(db_err.message().to_string())
             }
@@ -150,7 +366,9 @@ impl IntoResponse for AuthError {
         let (status, code) = match &self {
             AuthError::MissingToken => (StatusCode::UNAUTHORIZED, "AUTH_MISSING_TOKEN"),
             AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "AUTH_INVALID_TOKEN"),
-            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "AUTH_INVALID_CREDENTIALS"),
+            AuthError::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "AUTH_INVALID_CREDENTIALS")
+            }
             AuthError::AccountInactive => (StatusCode::FORBIDDEN, "AUTH_ACCOUNT_INACTIVE"),
             AuthError::Forbidden { .. } => (StatusCode::FORBIDDEN, "RBAC_FORBIDDEN"),
             AuthError::NotFound(_) => (StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND"),
@@ -169,11 +387,11 @@ impl IntoResponse for AuthError {
 }
 
 // ============================================================================
-// 5. Axum 0.8 Extractors for 3-Tier RBAC Hierarchy
+// 5. Axum 0.8 Extractors for 3-Tier RBAC Hierarchy (Backed by In-Memory Cache)
 // ============================================================================
 
 /// Base authenticated principal extracted on any protected route.
-/// Verifies both the JWT signature and live user active status / role in PostgreSQL.
+/// Verifies both the JWT signature and live user active status / role via `AppCache` + PostgreSQL fallback.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: Uuid,
@@ -208,17 +426,30 @@ where
         )
         .map_err(|_| AuthError::InvalidToken)?;
 
-        let row: Option<(SystemRole, bool)> = sqlx::query_as(
-            "SELECT system_role, is_active FROM users WHERE id = $1",
-        )
-        .bind(token_data.claims.sub)
-        .fetch_optional(&app_state.db)
-        .await
-        .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        let uid = token_data.claims.sub;
 
-        match row {
-            Some((live_role, true)) => Ok(AuthUser {
-                user_id: token_data.claims.sub,
+        let status = if let Some(cached) = app_state.cache.get_user_status(&uid) {
+            cached
+        } else {
+            let row: Option<(SystemRole, bool)> =
+                sqlx::query_as("SELECT system_role, is_active FROM users WHERE id = $1")
+                    .bind(uid)
+                    .fetch_optional(&app_state.db)
+                    .await
+                    .map_err(|e| AuthError::InternalError(e.to_string()))?;
+
+            match row {
+                Some(st) => {
+                    app_state.cache.set_user_status(uid, st);
+                    st
+                }
+                None => return Err(AuthError::AccountInactive),
+            }
+        };
+
+        match status {
+            (live_role, true) => Ok(AuthUser {
+                user_id: uid,
                 email: token_data.claims.email,
                 system_role: live_role,
             }),
@@ -308,7 +539,7 @@ where
 }
 
 // ============================================================================
-// 6. Database-Enforced Space & Grid Access Guard (`SpaceAccess`)
+// 6. Cached + Database-Enforced Space & Grid Access Guard (`SpaceAccess`)
 // ============================================================================
 
 /// Resolved permission context for a specific Workspace (`Space`).
@@ -343,9 +574,38 @@ impl SpaceAccess {
     }
 }
 
+/// Resolves a user's effective `SpaceRole` for a given `space_id` using `AppCache` with PostgreSQL fallback.
+pub async fn resolve_space_access_cached(
+    state: &AppState,
+    user: AuthUser,
+    space_id: Uuid,
+) -> Result<SpaceAccess, AuthError> {
+    if user.system_role.is_super_admin() {
+        return Ok(SpaceAccess {
+            user,
+            space_id,
+            effective_space_role: SpaceRole::SpaceAdmin,
+        });
+    }
+
+    if let Some(cached_role) = state.cache.get_space_access(user.user_id, space_id) {
+        return Ok(SpaceAccess {
+            user,
+            space_id,
+            effective_space_role: cached_role,
+        });
+    }
+
+    let access = resolve_space_access(&state.db, user, space_id).await?;
+    state.cache.set_space_access(
+        access.user.user_id,
+        space_id,
+        access.effective_space_role,
+    );
+    Ok(access)
+}
+
 /// Resolves a user's effective `SpaceRole` for a given `space_id`.
-/// - `SuperAdmin` automatically receives `SpaceRole::SpaceAdmin` across all Spaces.
-/// - `Admin` and `User` must have an explicit membership row in `space_members`.
 pub async fn resolve_space_access(
     db: &PgPool,
     user: AuthUser,
@@ -387,6 +647,37 @@ pub async fn resolve_space_access(
     }
 }
 
+/// Resolves a user's `SpaceAccess` via a `grid_id` lookup using `AppCache` with PostgreSQL fallback.
+pub async fn resolve_grid_access_cached(
+    state: &AppState,
+    user: AuthUser,
+    grid_id: Uuid,
+) -> Result<SpaceAccess, AuthError> {
+    if let (Some(space_id), Some(role)) = (
+        state.cache.get_grid_space(&grid_id),
+        if user.system_role.is_super_admin() {
+            Some(SpaceRole::SpaceAdmin)
+        } else {
+            state.cache.get_grid_access(user.user_id, grid_id)
+        },
+    ) {
+        return Ok(SpaceAccess {
+            user,
+            space_id,
+            effective_space_role: role,
+        });
+    }
+
+    let access = resolve_grid_access(&state.db, user, grid_id).await?;
+    state.cache.set_grid_space(grid_id, access.space_id);
+    state.cache.set_grid_access(
+        access.user.user_id,
+        grid_id,
+        access.effective_space_role,
+    );
+    Ok(access)
+}
+
 /// Resolves a user's `SpaceAccess` via a `grid_id` lookup, verifying both grid existence
 /// and space-level/grid-level permissions in a single query.
 pub async fn resolve_grid_access(
@@ -402,7 +693,8 @@ pub async fn resolve_grid_access(
     .await
     .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
-    let (space_id,) = space_row.ok_or_else(|| AuthError::NotFound(format!("Grid {grid_id} not found")))?;
+    let (space_id,) =
+        space_row.ok_or_else(|| AuthError::NotFound(format!("Grid {grid_id} not found")))?;
 
     if user.system_role.is_super_admin() {
         return Ok(SpaceAccess {
@@ -412,7 +704,6 @@ pub async fn resolve_grid_access(
         });
     }
 
-    // Check space_members and optional page_grid_permissions override
     let row: Option<(SpaceRole, Option<bool>)> = sqlx::query_as(
         r#"
         SELECT sm.space_role, pgp.can_edit
@@ -437,12 +728,12 @@ pub async fn resolve_grid_access(
             space_id,
             effective_space_role: SpaceRole::SpaceAdmin,
         }),
-        Some(( _, Some(true))) => Ok(SpaceAccess {
+        Some((_, Some(true))) => Ok(SpaceAccess {
             user,
             space_id,
             effective_space_role: SpaceRole::Editor,
         }),
-        Some(( _, Some(false))) => Ok(SpaceAccess {
+        Some((_, Some(false))) => Ok(SpaceAccess {
             user,
             space_id,
             effective_space_role: SpaceRole::Viewer,
@@ -458,7 +749,8 @@ pub async fn resolve_grid_access(
     }
 }
 
-/// Writes a structured audit log entry to `audit_logs`.
+/// Asynchronously writes a structured audit log entry to `audit_logs` via `tokio::spawn`
+/// so request latency is never blocked on non-critical audit logging.
 pub async fn record_audit_log(
     db: &PgPool,
     actor_id: Uuid,
@@ -467,19 +759,23 @@ pub async fn record_audit_log(
     action: &str,
     metadata: serde_json::Value,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO audit_logs (actor_id, space_id, grid_id, action, metadata)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(actor_id)
-    .bind(space_id)
-    .bind(grid_id)
-    .bind(action)
-    .bind(metadata)
-    .execute(db)
-    .await?;
+    let db_clone = db.clone();
+    let action_owned = action.to_string();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO audit_logs (actor_id, space_id, grid_id, action, metadata)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(actor_id)
+        .bind(space_id)
+        .bind(grid_id)
+        .bind(action_owned)
+        .bind(metadata)
+        .execute(&db_clone)
+        .await;
+    });
     Ok(())
 }
 
@@ -492,7 +788,7 @@ pub async fn require_space_access_middleware(
 ) -> Result<Response, AuthError> {
     let (mut parts, body) = req.into_parts();
     let user = AuthUser::from_request_parts(&mut parts, &state).await?;
-    let access = resolve_space_access(&state.db, user, space_id).await?;
+    let access = resolve_space_access_cached(&state, user, space_id).await?;
 
     parts.extensions.insert(access);
     req = Request::from_parts(parts, body);

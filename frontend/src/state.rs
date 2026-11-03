@@ -17,6 +17,7 @@ pub struct AuthState {
     pub space_grids: RwSignal<HashMap<Uuid, Vec<PageGrid>>>,
     pub active_space_id: RwSignal<Option<Uuid>>,
     pub active_grid_id: RwSignal<Option<Uuid>>,
+    pub highlighted_row_id: RwSignal<Option<Uuid>>,
     pub dark_mode: RwSignal<bool>,
     pub sidebar_collapsed: RwSignal<bool>,
 }
@@ -34,6 +35,7 @@ impl AuthState {
             space_grids: RwSignal::new(HashMap::new()),
             active_space_id: RwSignal::new(None),
             active_grid_id: RwSignal::new(None),
+            highlighted_row_id: RwSignal::new(None),
             dark_mode: RwSignal::new(stored_dark),
             sidebar_collapsed: RwSignal::new(false),
         }
@@ -57,6 +59,7 @@ impl AuthState {
         self.space_grids.set(HashMap::new());
         self.active_space_id.set(None);
         self.active_grid_id.set(None);
+        self.highlighted_row_id.set(None);
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -121,4 +124,3 @@ impl AuthState {
         }
     }
 }
-

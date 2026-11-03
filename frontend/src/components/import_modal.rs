@@ -1,6 +1,6 @@
 use crate::{api::ApiClient, state::AuthState};
 use leptos::{prelude::*, task::spawn_local};
-use pyra_ocean_shared::{ImportGridResponse, ImportMode};
+use pyra_ocean_shared::{ImportGridResponse, ImportMode, PreviewImportResponse};
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 
@@ -17,11 +17,34 @@ pub fn ImportModal(
     let selected_file = RwSignal::new(Option::<web_sys::File>::None);
     let selected_filename = RwSignal::new(String::new());
     let is_dragging = RwSignal::new(false);
+    let is_previewing = RwSignal::new(false);
     let is_uploading = RwSignal::new(false);
     let error_msg = RwSignal::new(Option::<String>::None);
+    let preview_data = RwSignal::new(Option::<PreviewImportResponse>::None);
     let completed_summary = RwSignal::new(Option::<ImportGridResponse>::None);
 
     let file_input_ref = NodeRef::<leptos::html::Input>::new();
+
+    let run_preview = move |file: web_sys::File, mode: ImportMode| {
+        let Some(sid) = space_id.get_untracked() else {
+            return;
+        };
+        is_previewing.set(true);
+        error_msg.set(None);
+        spawn_local(async move {
+            match ApiClient::preview_import_file(&auth, sid, mode, file).await {
+                Ok(preview) => {
+                    is_previewing.set(false);
+                    preview_data.set(Some(preview));
+                }
+                Err(err) => {
+                    is_previewing.set(false);
+                    preview_data.set(None);
+                    error_msg.set(Some(err));
+                }
+            }
+        });
+    };
 
     let on_file_picked = move |ev: web_sys::Event| {
         if let Some(target) = ev.target() {
@@ -29,8 +52,10 @@ pub fn ImportModal(
                 if let Some(files) = input.files() {
                     if let Some(file) = files.get(0) {
                         selected_filename.set(file.name());
-                        selected_file.set(Some(file));
+                        selected_file.set(Some(file.clone()));
+                        completed_summary.set(None);
                         error_msg.set(None);
+                        run_preview(file, selected_mode.get_untracked());
                     }
                 }
             }
@@ -44,8 +69,10 @@ pub fn ImportModal(
             if let Some(files) = dt.files() {
                 if let Some(file) = files.get(0) {
                     selected_filename.set(file.name());
-                    selected_file.set(Some(file));
+                    selected_file.set(Some(file.clone()));
+                    completed_summary.set(None);
                     error_msg.set(None);
+                    run_preview(file, selected_mode.get_untracked());
                 }
             }
         }
@@ -58,7 +85,7 @@ pub fn ImportModal(
         };
         let Some(file) = selected_file.get() else {
             error_msg.set(Some(
-                "Please select or drop a .csv, .json, or .md file to import.".into(),
+                "Please select or drop a .csv, .json, .md, or .pdf file to import.".into(),
             ));
             return;
         };
@@ -95,22 +122,23 @@ pub fn ImportModal(
     view! {
         <Show when=move || space_id.get().is_some()>
             <div class="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
-                <div class="w-full max-w-xl bg-[#1E2227] border border-[#2A2F37] rounded-2xl p-6 shadow-2xl space-y-5 text-[#F1F5F9]">
+                <div class="w-full max-w-3xl max-h-[90vh] overflow-y-auto bg-[#1E2227] border border-[#2A2F37] rounded-2xl p-6 shadow-2xl space-y-5 text-[#F1F5F9]">
                     // Modal Header
                     <div class="flex items-center justify-between border-b border-[#2A2F37] pb-3">
                         <div>
                             <h3 class="text-lg font-bold text-white flex items-center gap-2">
                                 <span class="text-[#06B6D4]">"⇄"</span>
-                                <span>"Import from Notion / AppFlowy"</span>
+                                <span>"Import from Notion / AppFlowy / PDF"</span>
                             </h3>
                             <p class="text-xs text-slate-400">
-                                "Ingest CSV, JSON, or Markdown table exports into a high-speed PyraOcean Grid"
+                                "Ingest CSV, JSON, Markdown, or coordinate-aligned PDF tables into a high-speed PyraOcean Grid"
                             </p>
                         </div>
                         <button
                             type="button"
                             on:click=move |_| {
                                 completed_summary.set(None);
+                                preview_data.set(None);
                                 selected_file.set(None);
                                 selected_filename.set(String::new());
                                 on_close.run(());
@@ -166,12 +194,12 @@ pub fn ImportModal(
                             />
                         </div>
 
-                        // Drag-and-Drop Zone accepting `.csv`, `.json`, and `.md`
+                        // Drag-and-Drop Zone accepting `.csv`, `.json`, `.md`, and `.pdf`
                         <div>
                             <input
                                 node_ref=file_input_ref
                                 type="file"
-                                accept=".csv,.json,.md,.markdown,text/csv,application/json,text/markdown"
+                                accept=".csv,.json,.md,.markdown,.pdf,text/csv,application/json,text/markdown,application/pdf"
                                 class="hidden"
                                 on:change=on_file_picked
                             />
@@ -208,7 +236,7 @@ pub fn ImportModal(
                                     }}
                                 </div>
                                 <p class="text-[11px] text-slate-400 mt-1">
-                                    "Supports .csv (auto-detects ',', ';', or tab), .json arrays, and .md Markdown tables"
+                                    "Supports .csv (auto-detects ',', ';', or tab), .json arrays, .md Markdown tables, and .pdf documents"
                                 </p>
                             </div>
                         </div>
@@ -221,7 +249,12 @@ pub fn ImportModal(
                             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                 // Mode A: Formatted Import (Smart Schema Inference)
                                 <div
-                                    on:click=move |_| selected_mode.set(ImportMode::FormattedSchemaInference)
+                                    on:click=move |_| {
+                                        selected_mode.set(ImportMode::FormattedSchemaInference);
+                                        if let Some(f) = selected_file.get_untracked() {
+                                            run_preview(f, ImportMode::FormattedSchemaInference);
+                                        }
+                                    }
                                     class=move || {
                                         let active = selected_mode.get() == ImportMode::FormattedSchemaInference;
                                         let cls = if active {
@@ -247,7 +280,12 @@ pub fn ImportModal(
 
                                 // Mode B: Unformatted Import (Raw Text Mode)
                                 <div
-                                    on:click=move |_| selected_mode.set(ImportMode::UnformattedRawText)
+                                    on:click=move |_| {
+                                        selected_mode.set(ImportMode::UnformattedRawText);
+                                        if let Some(f) = selected_file.get_untracked() {
+                                            run_preview(f, ImportMode::UnformattedRawText);
+                                        }
+                                    }
                                     class=move || {
                                         let active = selected_mode.get() == ImportMode::UnformattedRawText;
                                         let cls = if active {
@@ -273,11 +311,87 @@ pub fn ImportModal(
                             </div>
                         </div>
 
+                        // Interactive Table Preview ("Preview & Import")
+                        <Show when=move || is_previewing.get()>
+                            <div class="p-3 rounded-xl bg-[#14171A] border border-[#2A2F37] text-xs text-slate-400 text-center">
+                                "Analyzing layout & inferring column schema preview..."
+                            </div>
+                        </Show>
+
+                        {move || {
+                            preview_data.get().map(|prev| {
+                                let cols = prev.columns.clone();
+                                let srows = prev.sample_rows.clone();
+                                view! {
+                                    <div class="rounded-xl bg-[#14171A] border border-[#2A2F37] overflow-hidden space-y-0">
+                                        <div class="px-3.5 py-2 border-b border-[#2A2F37] bg-[#111315] flex items-center justify-between text-[11px]">
+                                            <span class="font-semibold text-[#06B6D4]">
+                                                {format!(
+                                                    "Table Preview — {} columns · {} total rows",
+                                                    cols.len(),
+                                                    prev.total_row_count
+                                                )}
+                                            </span>
+                                            <span class="text-slate-400 font-mono">
+                                                {format!("Showing first {} row(s)", srows.len())}
+                                            </span>
+                                        </div>
+                                        <div class="overflow-x-auto max-h-52">
+                                            <table class="w-full border-collapse text-left text-xs">
+                                                <thead>
+                                                    <tr class="border-b border-[#2A2F37] bg-[#181B20]">
+                                                        {cols
+                                                            .into_iter()
+                                                            .map(|c| {
+                                                                view! {
+                                                                    <th class="px-3 py-2 border-r border-[#2A2F37] font-semibold text-white whitespace-nowrap">
+                                                                        <div class="flex items-center gap-1.5">
+                                                                            <span>{c.name}</span>
+                                                                            <span class="px-1.5 py-0.2 rounded bg-[#06B6D4]/15 text-[#06B6D4] font-mono text-[9px] uppercase">
+                                                                                {format!("{:?}", c.inferred_type)}
+                                                                            </span>
+                                                                        </div>
+                                                                    </th>
+                                                                }
+                                                            })
+                                                            .collect_view()}
+                                                    </tr>
+                                                </thead>
+                                                <tbody class="divide-y divide-[#2A2F37]/60">
+                                                    {srows
+                                                        .into_iter()
+                                                        .map(|r| {
+                                                            view! {
+                                                                <tr class="hover:bg-slate-800/30">
+                                                                    {r.into_iter()
+                                                                        .map(|cell_text| {
+                                                                            view! {
+                                                                                <td class="px-3 py-1.5 border-r border-[#2A2F37]/60 text-slate-300 whitespace-nowrap max-w-[220px] truncate">
+                                                                                    {cell_text}
+                                                                                </td>
+                                                                            }
+                                                                        })
+                                                                        .collect_view()}
+                                                                </tr>
+                                                            }
+                                                        })
+                                                        .collect_view()}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                }
+                            })
+                        }}
+
                         // Footer Buttons
                         <div class="pt-3 flex items-center justify-end gap-2 border-t border-[#2A2F37]">
                             <button
                                 type="button"
-                                on:click=move |_| on_close.run(())
+                                on:click=move |_| {
+                                    preview_data.set(None);
+                                    on_close.run(());
+                                }
                                 class="px-3.5 py-2 rounded-lg border border-[#2A2F37] text-xs text-slate-300 hover:bg-slate-800"
                             >
                                 "Close"
@@ -287,7 +401,7 @@ pub fn ImportModal(
                                 disabled=move || is_uploading.get()
                                 class="px-5 py-2 rounded-lg bg-gradient-to-r from-[#F97316] to-[#EA580C] hover:from-[#EA580C] hover:to-[#F97316] text-white text-xs font-semibold shadow-lg transition disabled:opacity-50"
                             >
-                                {move || if is_uploading.get() { "Importing & Inferring Schema..." } else { "Start Import →" }}
+                                {move || if is_uploading.get() { "Importing & Inferring Schema..." } else { "Confirm & Start Import →" }}
                             </button>
                         </div>
                     </form>

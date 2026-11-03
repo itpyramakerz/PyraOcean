@@ -2,7 +2,7 @@ pub mod auth;
 pub mod routes;
 pub mod services;
 
-use auth::{hash_password, AppState, JwtConfig};
+use auth::{hash_password, AppCache, AppState, JwtConfig};
 use axum::{
     extract::{DefaultBodyLimit, State},
     routing::{delete, get, patch, post},
@@ -98,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db,
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret, 24)),
         uploads_dir: uploads_dir.clone(),
+        cache: Arc::new(AppCache::new()),
     };
 
     // Serve `/public` and `/assets` from compiled Trunk `/app/dist/public` in Docker,
@@ -146,16 +147,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(routes::grids::list_space_grids).post(routes::grids::create_grid),
         )
         .route(
+            "/api/spaces/{space_id}/grids/bulk",
+            delete(routes::grids::bulk_delete_grids),
+        )
+        .route(
             "/api/grids/{grid_id}",
-            get(routes::grids::get_grid_schema).patch(routes::grids::update_grid),
+            get(routes::grids::get_grid_schema)
+                .patch(routes::grids::update_grid)
+                .delete(routes::grids::delete_grid),
         )
         .route(
             "/api/grids/{grid_id}/reset-layout",
             post(routes::grids::reset_grid_layout),
         )
         .route(
+            "/api/grids/{grid_id}/export",
+            get(services::exporter::export_grid_handler),
+        )
+        .route(
             "/api/grids/{grid_id}/history",
             get(routes::grids::list_grid_history),
+        )
+        .route(
+            "/api/grids/{grid_id}/history/{history_id}",
+            get(routes::grids::get_grid_history_detail),
         )
         .route(
             "/api/grids/{grid_id}/history/{history_id}/restore",
@@ -201,10 +216,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/grids/{grid_id}/rows/{row_id}/upload",
             post(routes::grids::upload_cell_file),
         )
-        // Module 3: Notion & AppFlowy Data Import Engine
+        // Module 3: Notion, AppFlowy & PDF Data Import Engine
         .route(
             "/api/spaces/{space_id}/grids/import",
             post(services::importer::import_grid_handler),
+        )
+        .route(
+            "/api/spaces/{space_id}/grids/import/preview",
+            post(services::importer::preview_import_handler),
         )
         // Module 4: 3-Tier Scoped Search Engine (Current Grid, Space, All Spaces)
         .route("/api/search", get(routes::search::search_handler))
@@ -288,6 +307,6 @@ async fn health_check(State(state): State<AppState>) -> Json<Value> {
             "powered_by": "Powered by Pyramakerz",
             "powered_by_logo": "/public/pyramakerz.webp"
         },
-        "phase": 7
+        "phase": 12
     }))
 }

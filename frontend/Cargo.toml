@@ -18,6 +18,13 @@ web-sys = { version = "0.3", features = [
     "History",
     "Document",
     "Element",
+    "DomRect",
+    "HtmlElement",
+    "HtmlDocument",
+    "HtmlTextAreaElement",
+    "Node",
+    "Navigator",
+    "Clipboard",
     "Event",
     "SubmitEvent",
     "DragEvent",
@@ -28,10 +35,15 @@ web-sys = { version = "0.3", features = [
     "KeyboardEvent",
     "MouseEvent",
     "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "HtmlAnchorElement",
+    "HtmlIFrameElement",
     "File",
     "FileList",
     "FormData",
 ] }
+js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"

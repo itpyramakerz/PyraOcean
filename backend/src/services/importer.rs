@@ -1,5 +1,5 @@
 use crate::{
-    auth::{record_audit_log, resolve_space_access, AppState, AuthError, RequireSpaceAccess},
+    auth::{record_audit_log, resolve_space_access_cached, AppState, AuthError, RequireSpaceAccess},
     routes::grids::record_grid_history_snapshot,
 };
 use axum::{
@@ -12,8 +12,8 @@ use flate2::read::ZlibDecoder;
 use pulldown_cmark::{Event, Parser};
 use pyra_ocean_shared::{
     CellValue, ChecklistItem, ColumnPropertyConfig, ColumnPropertyType, FileAttachment,
-    GridColumn, ImportGridResponse, ImportMode, NumberFormat, PageGrid, RowCellMap, SelectOption,
-    TagColor,
+    GridColumn, ImportGridResponse, ImportMode, NumberFormat, PageGrid, PreviewColumnInfo,
+    PreviewImportResponse, RowCellMap, SelectOption, TagColor,
 };
 use serde_json::json;
 use sqlx::{Postgres, QueryBuilder};
@@ -67,7 +67,7 @@ pub async fn import_grid_handler(
     Path(space_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ImportGridResponse>), AuthError> {
-    let access = resolve_space_access(&state.db, user.clone(), space_id).await?;
+    let access = resolve_space_access_cached(&state, user.clone(), space_id).await?;
     access.ensure_manage()?;
 
     let mut grid_title: Option<String> = None;
@@ -297,6 +297,8 @@ pub async fn import_grid_handler(
 
     tx.commit().await?;
 
+    state.cache.invalidate_space(&space_id);
+
     let imported_row_count = prepared_rows.len();
 
     record_audit_log(
@@ -335,6 +337,140 @@ pub async fn import_grid_handler(
             detected_delimiter: dataset.detected_delimiter.map(|c| c.to_string()),
         }),
     ))
+}
+
+/// `POST /api/spaces/{space_id}/grids/import/preview`
+/// Parses an uploaded `.pdf`, `.csv`, `.json`, or `.md` file without writing to PostgreSQL,
+/// returning the detected column headers, inferred property types, total row count, and sample rows
+/// for interactive preview inside the Import Modal.
+pub async fn preview_import_handler(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(space_id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<Json<PreviewImportResponse>, AuthError> {
+    let access = resolve_space_access_cached(&state, user, space_id).await?;
+    access.ensure_manage()?;
+
+    let mut import_mode = ImportMode::FormattedSchemaInference;
+    let mut filename = String::from("Imported Grid.csv");
+    let mut raw_bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AuthError::BadRequest(format!("Invalid multipart payload: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "mode" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| AuthError::BadRequest(e.to_string()))?;
+                let norm = text.trim().to_lowercase();
+                if norm == "unformatted" || norm == "unformatted_raw_text" || norm == "raw" {
+                    import_mode = ImportMode::UnformattedRawText;
+                } else {
+                    import_mode = ImportMode::FormattedSchemaInference;
+                }
+            }
+            "file" => {
+                if let Some(fname) = field.file_name() {
+                    filename = fname.to_string();
+                }
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AuthError::BadRequest(format!("Failed to read upload: {e}")))?;
+                raw_bytes = Some(bytes.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    let file_bytes = raw_bytes.ok_or_else(|| {
+        AuthError::BadRequest("Multipart request must include a 'file' field".into())
+    })?;
+
+    let suggested_title = std::path::Path::new(&filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Imported Grid")
+        .to_string();
+
+    let is_pdf = filename.to_lowercase().ends_with(".pdf") || file_bytes.starts_with(b"%PDF");
+    let dataset = if is_pdf {
+        parse_pdf_dataset(&file_bytes)?
+    } else {
+        let content = String::from_utf8_lossy(&file_bytes)
+            .trim_start_matches('\u{feff}')
+            .to_string();
+        parse_tabular_input(&filename, &content)?
+    };
+
+    if dataset.headers.is_empty() {
+        return Err(AuthError::BadRequest(
+            "Uploaded file does not contain any recognizable columns".into(),
+        ));
+    }
+
+    let user_lookup = load_user_lookup(&state.db).await?;
+    let sample_refs: Vec<&Vec<String>> = dataset.rows.iter().take(25).collect();
+
+    let mut columns = Vec::with_capacity(dataset.headers.len());
+    for (col_idx, header_raw) in dataset.headers.iter().enumerate() {
+        let col_name = {
+            let cleaned = strip_markdown_and_html(header_raw);
+            if cleaned.is_empty() {
+                format!("Column {}", col_idx + 1)
+            } else {
+                cleaned
+            }
+        };
+
+        let inferred_type = match import_mode {
+            ImportMode::UnformattedRawText => ColumnPropertyType::Text,
+            ImportMode::FormattedSchemaInference => {
+                let samples: Vec<&str> = sample_refs
+                    .iter()
+                    .filter_map(|r| r.get(col_idx).map(|s| s.trim()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                infer_column_schema(&samples, &dataset.rows, col_idx, &user_lookup).0
+            }
+        };
+
+        columns.push(PreviewColumnInfo {
+            name: col_name,
+            inferred_type,
+        });
+    }
+
+    let total_row_count = dataset.rows.len();
+    let sample_rows: Vec<Vec<String>> = dataset
+        .rows
+        .into_iter()
+        .take(10)
+        .map(|mut row| {
+            if row.len() < columns.len() {
+                row.resize(columns.len(), String::new());
+            } else if row.len() > columns.len() && !columns.is_empty() {
+                let tail = row.split_off(columns.len() - 1).join(" ");
+                row.push(tail);
+            }
+            row
+        })
+        .collect();
+
+    Ok(Json(PreviewImportResponse {
+        suggested_title,
+        columns,
+        sample_rows,
+        total_row_count,
+        detected_delimiter: dataset.detected_delimiter.map(|c| c.to_string()),
+    }))
 }
 
 // ============================================================================
@@ -547,60 +683,89 @@ fn parse_markdown_table(content: &str) -> Result<ParsedDataset, AuthError> {
     })
 }
 
-/// Pure-Rust PDF text & tabular stream extractor supporting both uncompressed PDF content streams
-/// and FlateDecode (`zlib`) compressed streams.
-///
-/// Extracts text lines from `BT ... ET` blocks (`Tj`, `TJ`, `'`, `"`), then detects tabular
-/// column alignments via pipe delimiters (`|`), tab characters (`\t`), or multi-space gaps (`2+` spaces).
+/// Multi-Stage Coordinate/Layout-Aware PDF Table Parser:
+/// 1. Stage 1 (`pdftotext -layout -nopgbrk` + Rust Stream Fallback):
+///    Writes the PDF bytes to a temporary file and runs `pdftotext -layout -nopgbrk <temp_pdf> -`
+///    (from `poppler-utils`) to preserve exact 2D `(X, Y)` horizontal character spacing and vertical
+///    row alignment. Falls back to the pure-Rust PDF stream extractor if `pdftotext` is unavailable.
+/// 2. Stage 2 (Currency Protection, Smart Column Boundary Detection & Row Normalization):
+///    - Protects currency prefixes (`EGP 1,000`, `EGP 10,940`, `$ 75.00`, `USD 500`) so right-aligned
+///      currency spacing is never split into separate columns.
+///    - Filters out non-tabular header/footer banner lines and decorative borders.
+///    - Detects columns via pipes (`|`), tabs (`\t`), or horizontal multi-space gaps (`2+` spaces)
+///      and normalizes every extracted row to match the header column count.
 fn parse_pdf_dataset(pdf_bytes: &[u8]) -> Result<ParsedDataset, AuthError> {
-    let mut extracted_lines = extract_text_lines_from_pdf_streams(pdf_bytes);
-
-    // Fallback: if no `BT..ET` operators were matched, scan printable lines directly from the buffer
-    if extracted_lines.is_empty() {
-        let lossy = String::from_utf8_lossy(pdf_bytes);
-        for line in lossy.lines() {
-            let trimmed = line.trim();
-            if trimmed.len() >= 3
-                && !trimmed.starts_with('%')
-                && !trimmed.starts_with('/')
-                && !trimmed.starts_with("<<")
-                && !trimmed.starts_with(">>")
-                && !matches!(
-                    trimmed,
-                    "obj" | "endobj" | "stream" | "endstream" | "xref" | "trailer" | "startxref"
-                )
-                && !trimmed.ends_with(" obj")
-                && trimmed.chars().filter(|c| c.is_alphabetic()).count() >= 2
-            {
-                extracted_lines.push(trimmed.to_string());
+    let raw_layout_lines = extract_pdf_layout_via_pdftotext(pdf_bytes).unwrap_or_else(|| {
+        let mut stream_lines = extract_text_lines_from_pdf_streams(pdf_bytes);
+        if stream_lines.is_empty() {
+            let lossy = String::from_utf8_lossy(pdf_bytes);
+            for line in lossy.lines() {
+                let trimmed = line.trim();
+                if trimmed.len() >= 3
+                    && !trimmed.starts_with('%')
+                    && !trimmed.starts_with('/')
+                    && !trimmed.starts_with("<<")
+                    && !trimmed.starts_with(">>")
+                    && !matches!(
+                        trimmed,
+                        "obj" | "endobj" | "stream" | "endstream" | "xref" | "trailer" | "startxref"
+                    )
+                    && !trimmed.ends_with(" obj")
+                    && trimmed.chars().filter(|c| c.is_alphabetic()).count() >= 2
+                {
+                    stream_lines.push(line.to_string());
+                }
             }
         }
-    }
+        stream_lines
+    });
 
-    let clean_lines: Vec<String> = extracted_lines
+    // Filter out empty lines, decorative border lines (`---`, `===`), and standalone page footers
+    let candidate_lines: Vec<String> = raw_layout_lines
         .into_iter()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .map(|l| normalize_currency_spacing(&l))
+        .filter(|l| {
+            let trimmed = l.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            // Decorative border lines (`+---+---+`, `=======`, `-------`)
+            let is_border = trimmed
+                .chars()
+                .all(|c| matches!(c, '-' | '=' | '_' | '+' | '*' | ' ' | '─' | '━' | '│' | '┼'));
+            if is_border {
+                return false;
+            }
+            // Standalone page number lines like "Page 1 of 3" or "- 1 -"
+            let lower = trimmed.to_lowercase();
+            if (lower.starts_with("page ") && lower.len() <= 18 && !lower.contains("  "))
+                || (trimmed.starts_with("- ") && trimmed.ends_with(" -") && trimmed.len() <= 10)
+            {
+                return false;
+            }
+            true
+        })
         .collect();
 
-    if clean_lines.is_empty() {
+    if candidate_lines.is_empty() {
         return Err(AuthError::BadRequest(
             "Could not extract any readable text or table rows from the uploaded PDF file.".into(),
         ));
     }
 
-    // Split each PDF line into columns using:
-    // 1. Pipe delimiter (`|`) if present
-    // 2. Tab character (`\t`) if present
-    // 3. Multi-space column alignment (`2+` consecutive spaces)
-    // 4. Comma (`,`) if present across lines
     let mut split_rows: Vec<Vec<String>> = Vec::new();
     let mut detected_delim: Option<char> = Some(' ');
 
-    for line in &clean_lines {
-        let cols: Vec<String> = if line.contains('|') {
+    // Also compute vertical whitespace gap boundaries across fixed-width layout lines
+    // as a fallback when columns are separated by a single aligned space column.
+    let histogram_boundaries = detect_vertical_column_boundaries(&candidate_lines);
+
+    for line in &candidate_lines {
+        let trimmed = line.trim();
+        let raw_cols: Vec<String> = if trimmed.contains('|') {
             detected_delim = Some('|');
-            line.trim_matches('|')
+            trimmed
+                .trim_matches('|')
                 .split('|')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -611,15 +776,18 @@ fn parse_pdf_dataset(pdf_bytes: &[u8]) -> Result<ParsedDataset, AuthError> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
-        } else if line.contains("  ") {
-            split_on_multi_spaces(line)
-        } else if line.contains(',') && line.split(',').count() >= 2 {
+        } else if trimmed.contains("  ") {
+            split_on_multi_spaces(trimmed)
+        } else if histogram_boundaries.len() >= 2 {
+            split_line_by_boundaries(line, &histogram_boundaries)
+        } else if trimmed.contains(',') && trimmed.split(',').count() >= 2 {
             detected_delim = Some(',');
-            line.split(',').map(|s| s.trim().to_string()).collect()
+            trimmed.split(',').map(|s| s.trim().to_string()).collect()
         } else {
-            vec![line.clone()]
+            vec![trimmed.to_string()]
         };
 
+        let cols = merge_split_currency_tokens(raw_cols);
         if !cols.is_empty() {
             split_rows.push(cols);
         }
@@ -631,7 +799,8 @@ fn parse_pdf_dataset(pdf_bytes: &[u8]) -> Result<ParsedDataset, AuthError> {
         ));
     }
 
-    // Prefer multi-column rows (>= 2 columns) if the PDF has a title line followed by a table
+    // Filter out non-tabular header/footer banner lines (lines with fewer than 2 columns
+    // when multi-column table lines exist)
     let multi_col_rows: Vec<Vec<String>> = split_rows
         .iter()
         .filter(|r| r.len() >= 2)
@@ -639,19 +808,254 @@ fn parse_pdf_dataset(pdf_bytes: &[u8]) -> Result<ParsedDataset, AuthError> {
         .collect();
 
     let effective_rows = if multi_col_rows.len() >= 2 {
-        multi_col_rows
+        // Find the dominant (modal) column count among multi-column rows so title banners
+        // with 2 tokens don't override a 5-column table header
+        let mut col_count_freq: HashMap<usize, usize> = HashMap::new();
+        for r in &multi_col_rows {
+            *col_count_freq.entry(r.len()).or_insert(0) += 1;
+        }
+        let dominant_col_count = col_count_freq
+            .into_iter()
+            .max_by_key(|&(col_len, freq)| (freq, col_len))
+            .map(|(col_len, _)| col_len)
+            .unwrap_or(2);
+
+        // Start the table at the first row that has at least `dominant_col_count.saturating_sub(1).max(2)` columns
+        let min_header_cols = dominant_col_count.saturating_sub(1).max(2);
+        let start_idx = multi_col_rows
+            .iter()
+            .position(|r| r.len() >= min_header_cols)
+            .unwrap_or(0);
+        multi_col_rows.into_iter().skip(start_idx).collect()
     } else {
         split_rows
     };
 
     let headers = effective_rows[0].clone();
-    let rows: Vec<Vec<String>> = effective_rows.into_iter().skip(1).collect();
+    let target_col_count = headers.len().max(1);
+
+    // Normalize every extracted row to match `headers.len()` (pad short rows with empty strings
+    // and merge overflow tokens into the last column)
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(effective_rows.len().saturating_sub(1));
+    for mut row in effective_rows.into_iter().skip(1) {
+        // Skip repeated page headers if a multi-page PDF repeats the exact table header row
+        if row == headers {
+            continue;
+        }
+        if row.len() < target_col_count {
+            row.resize(target_col_count, String::new());
+        } else if row.len() > target_col_count {
+            let overflow = row.split_off(target_col_count - 1).join(" ");
+            row.push(overflow);
+        }
+        if row.iter().any(|c| !c.trim().is_empty()) {
+            rows.push(row);
+        }
+    }
 
     Ok(ParsedDataset {
         headers,
         rows,
         detected_delimiter: detected_delim,
     })
+}
+
+/// Runs `pdftotext -layout -nopgbrk <temp_pdf_path> -` to extract 2D layout-preserved text lines.
+/// Returns `None` if `pdftotext` is not installed or fails.
+fn extract_pdf_layout_via_pdftotext(pdf_bytes: &[u8]) -> Option<Vec<String>> {
+    let temp_path = std::env::temp_dir().join(format!("pyraocean_pdf_{}.pdf", Uuid::new_v4()));
+    if std::fs::write(&temp_path, pdf_bytes).is_err() {
+        return None;
+    }
+
+    let output_res = std::process::Command::new("pdftotext")
+        .args([
+            "-layout",
+            "-nopgbrk",
+            temp_path.to_str().unwrap_or_default(),
+            "-",
+        ])
+        .output();
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    let output = output_res.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
+    }
+}
+
+/// Collapses multi-space gaps between a currency prefix (`EGP`, `USD`, `EUR`, `GBP`, `SAR`, `AED`,
+/// `$`, `€`, `£`, `¥`) and a following number (`"EGP    1,000"` -> `"EGP 1,000"`) so right-aligned
+/// currency columns in `pdftotext -layout` stay together in a single cell.
+fn normalize_currency_spacing(line: &str) -> String {
+    const CURRENCY_PREFIXES: [&str; 10] = [
+        "EGP", "USD", "EUR", "GBP", "SAR", "AED", "$", "€", "£", "¥",
+    ];
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let remaining: String = chars[i..].iter().collect();
+        let mut matched_prefix: Option<&str> = None;
+
+        for &sym in &CURRENCY_PREFIXES {
+            if remaining.starts_with(sym) {
+                let prev_ok = i == 0 || !chars[i - 1].is_alphabetic();
+                let after_idx = i + sym.chars().count();
+                let next_is_space = after_idx < chars.len() && chars[after_idx] == ' ';
+                if prev_ok && next_is_space {
+                    matched_prefix = Some(sym);
+                    break;
+                }
+            }
+        }
+
+        if let Some(sym) = matched_prefix {
+            let sym_len = sym.chars().count();
+            let mut space_end = i + sym_len;
+            while space_end < chars.len() && chars[space_end] == ' ' {
+                space_end += 1;
+            }
+            if space_end < chars.len()
+                && (chars[space_end].is_ascii_digit()
+                    || (chars[space_end] == '-'
+                        && space_end + 1 < chars.len()
+                        && chars[space_end + 1].is_ascii_digit()))
+            {
+                // Keep the column alignment by shifting the extra spaces before the currency symbol
+                let extra_spaces = (space_end - (i + sym_len)).saturating_sub(1);
+                for _ in 0..extra_spaces {
+                    out.push(' ');
+                }
+                out.push_str(sym);
+                out.push(' ');
+                i = space_end;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Post-processes extracted row tokens to merge any standalone currency symbol token (`"EGP"`, `"$"`, etc.)
+/// with an immediately following numeric token (`"1,000"`, `"75.00"`).
+fn merge_split_currency_tokens(tokens: Vec<String>) -> Vec<String> {
+    const CURRENCY_CODES: [&str; 10] = [
+        "EGP", "USD", "EUR", "GBP", "SAR", "AED", "$", "€", "£", "¥",
+    ];
+    let mut merged: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let cur = tokens[idx].trim();
+        let is_currency = CURRENCY_CODES
+            .iter()
+            .any(|c| cur.eq_ignore_ascii_case(c));
+        if is_currency && idx + 1 < tokens.len() {
+            let next_tok = tokens[idx + 1].trim();
+            let looks_numeric = !next_tok.is_empty()
+                && next_tok
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit() || c == '-')
+                    .unwrap_or(false)
+                && next_tok
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | ' '));
+            if looks_numeric {
+                merged.push(format!("{cur} {next_tok}"));
+                idx += 2;
+                continue;
+            }
+        }
+        merged.push(tokens[idx].clone());
+        idx += 1;
+    }
+
+    merged
+}
+
+/// Analyzes vertical character column indices across candidate lines to detect consistent
+/// whitespace column boundaries in fixed-width layout tables.
+fn detect_vertical_column_boundaries(lines: &[String]) -> Vec<usize> {
+    if lines.len() < 2 {
+        return Vec::new();
+    }
+    let max_len = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(300);
+    if max_len < 10 {
+        return Vec::new();
+    }
+
+    let mut space_counts = vec![0usize; max_len];
+    let sample_count = lines.len().min(40);
+    for line in lines.iter().take(sample_count) {
+        let chars: Vec<char> = line.chars().collect();
+        for (col_idx, count) in space_counts.iter_mut().enumerate().take(max_len) {
+            if chars.get(col_idx).copied().unwrap_or(' ') == ' ' {
+                *count += 1;
+            }
+        }
+    }
+
+    let threshold = (sample_count * 85) / 100;
+    let mut boundaries = Vec::new();
+    let mut in_gap = true;
+    for (idx, &cnt) in space_counts.iter().enumerate() {
+        let is_space_col = cnt >= threshold.max(2);
+        if !is_space_col && in_gap {
+            boundaries.push(idx);
+            in_gap = false;
+        } else if is_space_col {
+            in_gap = true;
+        }
+    }
+    boundaries
+}
+
+fn split_line_by_boundaries(line: &str, boundaries: &[usize]) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut cols = Vec::with_capacity(boundaries.len());
+    for (i, &start) in boundaries.iter().enumerate() {
+        if start >= chars.len() {
+            cols.push(String::new());
+            continue;
+        }
+        let end = boundaries
+            .get(i + 1)
+            .copied()
+            .unwrap_or(chars.len())
+            .min(chars.len());
+        let slice: String = chars[start..end].iter().collect();
+        cols.push(slice.trim().to_string());
+    }
+    while cols.last().map(|s| s.is_empty()).unwrap_or(false) {
+        cols.pop();
+    }
+    cols
 }
 
 fn split_on_multi_spaces(line: &str) -> Vec<String> {

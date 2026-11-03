@@ -2,12 +2,15 @@ use crate::state::AuthState;
 use gloo_net::http::{Request, RequestBuilder};
 use leptos::prelude::GetUntracked;
 use pyra_ocean_shared::{
-    AuditLogEntry, BulkDeleteRowsRequest, BulkDeleteRowsResponse, CreateColumnRequest,
+    AuditLogEntry, BulkDeleteGridsRequest, BulkDeleteGridsResponse, BulkDeleteRowsRequest,
+    BulkDeleteRowsResponse, BulkPatchCellsRequest, BulkRowCellPatch, CreateColumnRequest,
     CreateGridRequest, CreateRowRequest, CreateSpaceRequest, CreateUserRequest,
-    GrantSpaceMemberRequest, GridColumn, GridRow, GridSchemaResponse, ImportGridResponse,
-    ImportMode, LoginRequest, LoginResponse, PageGrid, PatchRowRequest, RowCellMap, Space,
+    GrantSpaceMemberRequest, GridColumn, GridHistoryDetail, GridHistoryEntry, GridRow,
+    GridSchemaResponse, ImportGridResponse, ImportMode, LoginRequest, LoginResponse, PageGrid,
+    PatchRowRequest, PreviewImportResponse, ReorderColumnsRequest, ReorderRowsRequest,
+    RestoreGridHistoryResponse, RestoreRowsRequest, RowCellMap, SearchHit, SearchScope, Space,
     SpaceMember, SpaceMemberDetail, SpaceWithRole, SystemRole, UpdateColumnRequest,
-    UpdateUserRoleRequest, User, UserProfile,
+    UpdateGridRequest, UpdateUserRoleRequest, User, UserProfile,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
@@ -287,7 +290,7 @@ impl ApiClient {
     }
 
     // ========================================================================
-    // Phase 4: Dynamic Grid Schema, Rows, Bulk Delete, Multipart Upload & Import
+    // Dynamic Grid Schema, Column Reorder/Convert/Delete, Rows & Bulk Delete
     // ========================================================================
 
     pub async fn get_grid_schema(
@@ -296,6 +299,77 @@ impl ApiClient {
     ) -> Result<GridSchemaResponse, String> {
         let url = format!("/api/grids/{grid_id}");
         let req = Self::get_req(&url, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn update_grid(
+        auth: &AuthState,
+        grid_id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<PageGrid, String> {
+        let url = format!("/api/grids/{grid_id}");
+        let payload = UpdateGridRequest {
+            name,
+            description,
+            icon: None,
+        };
+        let req = Self::patch_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn delete_grid(auth: &AuthState, grid_id: Uuid) -> Result<(), String> {
+        let url = format!("/api/grids/{grid_id}");
+        let req = Self::delete_req(&url, auth)?;
+        Self::send_empty(req, auth).await
+    }
+
+    pub async fn bulk_delete_grids(
+        auth: &AuthState,
+        space_id: Uuid,
+        grid_ids: Vec<Uuid>,
+    ) -> Result<BulkDeleteGridsResponse, String> {
+        let url = format!("/api/spaces/{space_id}/grids/bulk");
+        let payload = BulkDeleteGridsRequest { grid_ids };
+        let req = Self::delete_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn reset_grid_layout(
+        auth: &AuthState,
+        grid_id: Uuid,
+    ) -> Result<Vec<GridColumn>, String> {
+        let url = format!("/api/grids/{grid_id}/reset-layout");
+        let req = Self::post_json_req(&url, &serde_json::json!({}), auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn list_grid_history(
+        auth: &AuthState,
+        grid_id: Uuid,
+    ) -> Result<Vec<GridHistoryEntry>, String> {
+        let url = format!("/api/grids/{grid_id}/history");
+        let req = Self::get_req(&url, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn get_grid_history_detail(
+        auth: &AuthState,
+        grid_id: Uuid,
+        history_id: Uuid,
+    ) -> Result<GridHistoryDetail, String> {
+        let url = format!("/api/grids/{grid_id}/history/{history_id}");
+        let req = Self::get_req(&url, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn restore_grid_history(
+        auth: &AuthState,
+        grid_id: Uuid,
+        history_id: Uuid,
+    ) -> Result<RestoreGridHistoryResponse, String> {
+        let url = format!("/api/grids/{grid_id}/history/{history_id}/restore");
+        let req = Self::post_json_req(&url, &serde_json::json!({}), auth)?;
         Self::send_json(req, auth).await
     }
 
@@ -309,6 +383,17 @@ impl ApiClient {
         Self::send_json(req, auth).await
     }
 
+    pub async fn reorder_columns(
+        auth: &AuthState,
+        grid_id: Uuid,
+        column_ids: Vec<Uuid>,
+    ) -> Result<Vec<GridColumn>, String> {
+        let url = format!("/api/grids/{grid_id}/columns/reorder");
+        let payload = ReorderColumnsRequest { column_ids };
+        let req = Self::patch_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
     pub async fn update_column(
         auth: &AuthState,
         grid_id: Uuid,
@@ -318,6 +403,16 @@ impl ApiClient {
         let url = format!("/api/grids/{grid_id}/columns/{col_id}");
         let req = Self::patch_json_req(&url, &payload, auth)?;
         Self::send_json(req, auth).await
+    }
+
+    pub async fn delete_column(
+        auth: &AuthState,
+        grid_id: Uuid,
+        col_id: Uuid,
+    ) -> Result<(), String> {
+        let url = format!("/api/grids/{grid_id}/columns/{col_id}");
+        let req = Self::delete_req(&url, auth)?;
+        Self::send_empty(req, auth).await
     }
 
     pub async fn list_rows(
@@ -354,9 +449,23 @@ impl ApiClient {
         grid_id: Uuid,
         cells: RowCellMap,
     ) -> Result<GridRow, String> {
+        Self::create_row_at(auth, grid_id, cells, None, None, None).await
+    }
+
+    pub async fn create_row_at(
+        auth: &AuthState,
+        grid_id: Uuid,
+        cells: RowCellMap,
+        insert_at_position: Option<i32>,
+        target_row_id: Option<Uuid>,
+        placement: Option<String>,
+    ) -> Result<GridRow, String> {
         let url = format!("/api/grids/{grid_id}/rows");
         let payload = CreateRowRequest {
             row_order: None,
+            insert_at_position,
+            target_row_id,
+            placement,
             cells,
         };
         let req = Self::post_json_req(&url, &payload, auth)?;
@@ -389,6 +498,39 @@ impl ApiClient {
         Self::send_json(req, auth).await
     }
 
+    pub async fn bulk_update_row_cells(
+        auth: &AuthState,
+        grid_id: Uuid,
+        updates: Vec<BulkRowCellPatch>,
+    ) -> Result<Vec<GridRow>, String> {
+        let url = format!("/api/grids/{grid_id}/rows/bulk-cells");
+        let payload = BulkPatchCellsRequest { updates };
+        let req = Self::patch_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn reorder_rows(
+        auth: &AuthState,
+        grid_id: Uuid,
+        row_ids: Vec<Uuid>,
+    ) -> Result<Vec<GridRow>, String> {
+        let url = format!("/api/grids/{grid_id}/rows/reorder");
+        let payload = ReorderRowsRequest { row_ids };
+        let req = Self::patch_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn restore_rows(
+        auth: &AuthState,
+        grid_id: Uuid,
+        rows: Vec<GridRow>,
+    ) -> Result<Vec<GridRow>, String> {
+        let url = format!("/api/grids/{grid_id}/rows/restore");
+        let payload = RestoreRowsRequest { rows };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
     pub async fn upload_cell_files(
         auth: &AuthState,
         grid_id: Uuid,
@@ -406,6 +548,30 @@ impl ApiClient {
         }
 
         let url = format!("/api/grids/{grid_id}/rows/{row_id}/upload");
+        let req = Self::attach_auth(Request::post(&url), auth)
+            .body(form)
+            .map_err(|e| e.to_string())?;
+
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn preview_import_file(
+        auth: &AuthState,
+        space_id: Uuid,
+        mode: ImportMode,
+        file: web_sys::File,
+    ) -> Result<PreviewImportResponse, String> {
+        let form = web_sys::FormData::new().map_err(|_| "Failed to create FormData".to_string())?;
+        let mode_str = match mode {
+            ImportMode::FormattedSchemaInference => "formatted_schema_inference",
+            ImportMode::UnformattedRawText => "unformatted_raw_text",
+        };
+        form.append_with_str("mode", mode_str)
+            .map_err(|_| "Failed to append import mode".to_string())?;
+        form.append_with_blob_and_filename("file", &file, &file.name())
+            .map_err(|_| "Failed to append import file".to_string())?;
+
+        let url = format!("/api/spaces/{space_id}/grids/import/preview");
         let req = Self::attach_auth(Request::post(&url), auth)
             .body(form)
             .map_err(|e| e.to_string())?;
@@ -441,6 +607,32 @@ impl ApiClient {
             .body(form)
             .map_err(|e| e.to_string())?;
 
+        Self::send_json(req, auth).await
+    }
+
+    // ========================================================================
+    // Phase 5: 3-Tier Scoped Search Engine (`GET /api/search`)
+    // ========================================================================
+
+    pub async fn search_workspace(
+        auth: &AuthState,
+        query: &str,
+        scope: SearchScope,
+        space_id: Option<Uuid>,
+        grid_id: Option<Uuid>,
+    ) -> Result<Vec<SearchHit>, String> {
+        let mut params = vec![
+            format!("q={}", query.trim()),
+            format!("scope={}", scope.as_str()),
+        ];
+        if let Some(sid) = space_id {
+            params.push(format!("space_id={sid}"));
+        }
+        if let Some(gid) = grid_id {
+            params.push(format!("grid_id={gid}"));
+        }
+        let url = format!("/api/search?{}", params.join("&"));
+        let req = Self::get_req(&url, auth)?;
         Self::send_json(req, auth).await
     }
 }

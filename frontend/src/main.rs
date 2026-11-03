@@ -4,7 +4,7 @@ pub mod pages;
 pub mod state;
 
 use api::ApiClient;
-use components::{import_modal::ImportModal, sidebar::Sidebar};
+use components::{import_modal::ImportModal, search_modal::SearchModal, sidebar::Sidebar};
 use leptos::{prelude::*, task::spawn_local};
 use pages::{
     admin::{AdminDashboard, AdminTab},
@@ -27,6 +27,7 @@ pub fn App() -> impl IntoView {
     let current_path = RwSignal::new(initial_pathname.clone());
     let admin_tab = RwSignal::new(AdminTab::Spaces);
     let import_modal_space = RwSignal::new(Option::<Uuid>::None);
+    let search_modal_open = RwSignal::new(false);
 
     let route_space_id = RwSignal::new(Uuid::nil());
     let route_grid_id = RwSignal::new(Uuid::nil());
@@ -100,13 +101,20 @@ pub fn App() -> impl IntoView {
             }
         >
             <div
+                tabindex="0"
+                on:keydown=move |ev: web_sys::KeyboardEvent| {
+                    if (ev.ctrl_key() || ev.meta_key()) && ev.key().eq_ignore_ascii_case("k") {
+                        ev.prevent_default();
+                        search_modal_open.update(|open| *open = !*open);
+                    }
+                }
                 class=move || {
                     let surface = if auth.dark_mode.get() {
                         "bg-[#14171A] text-[#F1F5F9]"
                     } else {
                         "bg-[#F8FAFC] text-[#0F172A]"
                     };
-                    format!("min-h-screen flex overflow-hidden font-sans {surface}")
+                    format!("h-screen w-screen overflow-hidden flex font-sans focus:outline-none {surface}")
                 }
             >
                 <Sidebar
@@ -115,9 +123,21 @@ pub fn App() -> impl IntoView {
                     on_open_import_modal=Callback::new(move |space_id: Uuid| {
                         import_modal_space.set(Some(space_id));
                     })
+                    on_open_search_modal=Callback::new(move |_| {
+                        search_modal_open.set(true);
+                    })
                 />
 
-                <main class="flex-1 h-screen overflow-y-auto">
+                <main
+                    class=move || {
+                        let path = current_path.get();
+                        if path.starts_with("/spaces/") && path.contains("/grids/") {
+                            "flex-1 h-full flex flex-col overflow-hidden relative"
+                        } else {
+                            "flex-1 h-full flex flex-col overflow-y-auto overflow-x-auto relative"
+                        }
+                    }
+                >
                     {move || {
                         let path = current_path.get();
                         if path.starts_with("/admin") {
@@ -125,10 +145,15 @@ pub fn App() -> impl IntoView {
                         } else if path.starts_with("/spaces/") && path.contains("/grids/") {
                             view! {
                                 <GridViewPage
+                                    current_path=current_path
                                     space_id=route_space_id
                                     grid_id=route_grid_id
+                                    on_navigate=navigate
                                     on_open_import=Callback::new(move |sid: Uuid| {
                                         import_modal_space.set(Some(sid));
+                                    })
+                                    on_open_search_modal=Callback::new(move |_| {
+                                        search_modal_open.set(true);
                                     })
                                 />
                             }
@@ -140,6 +165,9 @@ pub fn App() -> impl IntoView {
                                     on_navigate=navigate
                                     on_open_import=Callback::new(move |sid: Uuid| {
                                         import_modal_space.set(Some(sid));
+                                    })
+                                    on_open_search_modal=Callback::new(move |_| {
+                                        search_modal_open.set(true);
                                     })
                                 />
                             }
@@ -157,6 +185,15 @@ pub fn App() -> impl IntoView {
                         navigate.run(format!("/spaces/{sid}/grids/{gid}"));
                     })
                 />
+
+                // 3-Tier Scoped Search Modal (`This Grid` | `This Space` | `All Spaces`)
+                <SearchModal
+                    open=search_modal_open
+                    on_navigate_hit=Callback::new(move |(sid, gid, rid): (Uuid, Uuid, Option<Uuid>)| {
+                        auth.highlighted_row_id.set(rid);
+                        navigate.run(format!("/spaces/{sid}/grids/{gid}"));
+                    })
+                />
             </div>
         </Show>
     }
@@ -167,6 +204,7 @@ fn WorkspaceHomeView(
     current_path: RwSignal<String>,
     on_navigate: Callback<String>,
     on_open_import: Callback<Uuid>,
+    on_open_search_modal: Callback<()>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
@@ -204,6 +242,13 @@ fn WorkspaceHomeView(
                 </div>
 
                 <div class="flex items-center gap-2">
+                    <button
+                        type="button"
+                        on:click=move |_| on_open_search_modal.run(())
+                        class="px-3.5 py-2 rounded-lg bg-[#14171A] hover:bg-slate-800 text-slate-200 border border-[#2A2F37] text-xs font-semibold transition"
+                    >
+                        "🔍 Search Workspace (Ctrl+K)"
+                    </button>
                     {move || {
                         auth.spaces.get().first().map(|first_space| {
                             let sid = first_space.space.id;

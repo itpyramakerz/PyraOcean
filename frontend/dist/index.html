@@ -7,8 +7,8 @@
     
     
 <script type="module">
-import init, * as bindings from '/pyra_ocean_frontend-48ac1648234904bb.js';
-const wasm = await init({ module_or_path: '/pyra_ocean_frontend-5fc5ae4e68713013_bg.wasm' });
+import init, * as bindings from '/pyra_ocean_frontend-858553bee4aee00.js';
+const wasm = await init({ module_or_path: '/pyra_ocean_frontend-23b6cb907282ab88_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -39,7 +39,27 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             }
         };
     </script>
-<link rel="modulepreload" href="/pyra_ocean_frontend-48ac1648234904bb.js" crossorigin="anonymous" integrity="sha384-ynON06FmVdAQcn8FVsC3QQh5hCd9SIDMejzNn4aj6POdubuAT8gcUmuH5JOKEDlA"><link rel="preload" href="/pyra_ocean_frontend-5fc5ae4e68713013_bg.wasm" crossorigin="anonymous" integrity="sha384-3MUWNUph2iKXI1SMrQVRMCiBZdumGpbTxLVoo8jriiUrla6MDkRRNOtHZ/9WC+Vv" as="fetch" type="application/wasm"></head>
+    <style>
+        ::-webkit-scrollbar {
+            height: 10px;
+            width: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #14171A;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 5px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #06B6D4;
+        }
+        .custom-scrollbar {
+            scrollbar-width: thin;
+            scrollbar-color: #334155 #14171A;
+        }
+    </style>
+<link rel="modulepreload" href="/pyra_ocean_frontend-858553bee4aee00.js" crossorigin="anonymous" integrity="sha384-HBhdx90r5nUzY7Bz3ZswrJYmJMlbeGmNFq9HO1YDRMJM1yxxF+Vl32TVjpQO2KpR"><link rel="preload" href="/pyra_ocean_frontend-23b6cb907282ab88_bg.wasm" crossorigin="anonymous" integrity="sha384-TSDisvVzfNmgJX0TDZzpfMEZJeptxuuwUG3n9GKS29VrV6Q4UVzoLwIYdrc5cvFb" as="fetch" type="application/wasm"></head>
 <body class="bg-[#14171A] text-[#F1F5F9] antialiased selection:bg-orange-500/30 selection:text-orange-200">
 </body>
 </html>

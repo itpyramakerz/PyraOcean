@@ -1,5 +1,5 @@
 use crate::auth::{
-    record_audit_log, resolve_space_access, AppState, AuthError, RequireSpaceAccess,
+    record_audit_log, resolve_space_access_cached, AppState, AuthError, RequireSpaceAccess,
     RequireSpaceAdmin, RequireSuperAdmin,
 };
 use axum::{
@@ -129,6 +129,8 @@ pub async fn delete_space(
         return Err(AuthError::NotFound(format!("Space {space_id} not found")));
     }
 
+    state.cache.invalidate_space(&space_id);
+
     record_audit_log(
         &state.db,
         super_admin.user_id,
@@ -153,7 +155,7 @@ pub async fn list_space_members(
     RequireSpaceAccess(actor): RequireSpaceAccess,
     Path(space_id): Path<Uuid>,
 ) -> Result<Json<Vec<SpaceMemberDetail>>, AuthError> {
-    let _access = resolve_space_access(&state.db, actor, space_id).await?;
+    let _access = resolve_space_access_cached(&state, actor, space_id).await?;
 
     let members: Vec<SpaceMemberDetail> = sqlx::query_as(
         r#"
@@ -187,7 +189,7 @@ pub async fn grant_space_member(
     Path(space_id): Path<Uuid>,
     Json(payload): Json<GrantSpaceMemberRequest>,
 ) -> Result<(StatusCode, Json<SpaceMember>), AuthError> {
-    let access = resolve_space_access(&state.db, actor.clone(), space_id).await?;
+    let access = resolve_space_access_cached(&state, actor.clone(), space_id).await?;
     access.ensure_manage()?;
 
     if !payload.can_view && !payload.can_edit && !payload.is_space_admin {
@@ -220,6 +222,9 @@ pub async fn grant_space_member(
     .fetch_one(&state.db)
     .await?;
 
+    state.cache.invalidate_user(&payload.user_id);
+    state.cache.invalidate_space(&space_id);
+
     record_audit_log(
         &state.db,
         actor.user_id,
@@ -243,7 +248,7 @@ pub async fn revoke_space_member(
     RequireSpaceAdmin(actor): RequireSpaceAdmin,
     Path((space_id, target_user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AuthError> {
-    let access = resolve_space_access(&state.db, actor.clone(), space_id).await?;
+    let access = resolve_space_access_cached(&state, actor.clone(), space_id).await?;
     access.ensure_manage()?;
 
     let deleted = sqlx::query(
@@ -259,6 +264,9 @@ pub async fn revoke_space_member(
             "User is not a member of this Space".into(),
         ));
     }
+
+    state.cache.invalidate_user(&target_user_id);
+    state.cache.invalidate_space(&space_id);
 
     record_audit_log(
         &state.db,

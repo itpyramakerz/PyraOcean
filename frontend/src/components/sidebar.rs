@@ -9,12 +9,16 @@ pub fn Sidebar(
     current_path: RwSignal<String>,
     on_navigate: Callback<String>,
     on_open_import_modal: Callback<Uuid>,
+    on_open_search_modal: Callback<()>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
     let expanded_spaces = RwSignal::new(HashSet::<Uuid>::new());
     let creating_grid_for_space = RwSignal::new(Option::<Uuid>::None);
     let new_grid_title = RwSignal::new(String::new());
     let sidebar_error = RwSignal::new(Option::<String>::None);
+    let selected_sidebar_grids = RwSignal::new(HashSet::<Uuid>::new());
+    let confirming_delete_grid_id = RwSignal::new(Option::<Uuid>::None);
+    let confirming_bulk_delete_space_id = RwSignal::new(Option::<Uuid>::None);
 
     // Fetch accessible Spaces whenever the user session becomes active
     Effect::new(move |_| {
@@ -78,6 +82,86 @@ pub fn Sidebar(
                     auth.active_space_id.set(Some(space_id));
                     auth.active_grid_id.set(Some(grid_id));
                     on_navigate.run(format!("/spaces/{space_id}/grids/{grid_id}"));
+                }
+                Err(e) => sidebar_error.set(Some(e)),
+            }
+        });
+    };
+
+    let handle_single_delete_grid = move |space_id: Uuid, grid_id: Uuid| {
+        spawn_local(async move {
+            match ApiClient::delete_grid(&auth, grid_id).await {
+                Ok(()) => {
+                    let mut next_grid_id: Option<Uuid> = None;
+                    auth.space_grids.update(|map| {
+                        if let Some(list) = map.get_mut(&space_id) {
+                            list.retain(|g| g.id != grid_id);
+                            next_grid_id = list.first().map(|g| g.id);
+                        }
+                    });
+                    selected_sidebar_grids.update(|set| {
+                        set.remove(&grid_id);
+                    });
+                    confirming_delete_grid_id.set(None);
+
+                    let active_gid = auth.active_grid_id.get_untracked();
+                    let cur_path = current_path.get_untracked();
+                    if active_gid == Some(grid_id) || cur_path.ends_with(&grid_id.to_string()) {
+                        if let Some(next_id) = next_grid_id {
+                            auth.active_space_id.set(Some(space_id));
+                            auth.active_grid_id.set(Some(next_id));
+                            on_navigate.run(format!("/spaces/{space_id}/grids/{next_id}"));
+                        } else {
+                            auth.active_grid_id.set(None);
+                            on_navigate.run("/".into());
+                        }
+                    }
+                }
+                Err(e) => sidebar_error.set(Some(e)),
+            }
+        });
+    };
+
+    let handle_bulk_delete_space_grids = move |space_id: Uuid, grid_ids: Vec<Uuid>| {
+        if grid_ids.is_empty() {
+            return;
+        }
+        let deleted_set: HashSet<Uuid> = grid_ids.iter().copied().collect();
+        spawn_local(async move {
+            match ApiClient::bulk_delete_grids(&auth, space_id, grid_ids).await {
+                Ok(_) => {
+                    let mut next_grid_id: Option<Uuid> = None;
+                    auth.space_grids.update(|map| {
+                        if let Some(list) = map.get_mut(&space_id) {
+                            list.retain(|g| !deleted_set.contains(&g.id));
+                            next_grid_id = list.first().map(|g| g.id);
+                        }
+                    });
+                    selected_sidebar_grids.update(|set| {
+                        for id in &deleted_set {
+                            set.remove(id);
+                        }
+                    });
+                    confirming_bulk_delete_space_id.set(None);
+
+                    let active_gid = auth.active_grid_id.get_untracked();
+                    let cur_path = current_path.get_untracked();
+                    let viewing_deleted = active_gid
+                        .map(|id| deleted_set.contains(&id))
+                        .unwrap_or(false)
+                        || deleted_set
+                            .iter()
+                            .any(|id| cur_path.ends_with(&id.to_string()));
+                    if viewing_deleted {
+                        if let Some(next_id) = next_grid_id {
+                            auth.active_space_id.set(Some(space_id));
+                            auth.active_grid_id.set(Some(next_id));
+                            on_navigate.run(format!("/spaces/{space_id}/grids/{next_id}"));
+                        } else {
+                            auth.active_grid_id.set(None);
+                            on_navigate.run("/".into());
+                        }
+                    }
                 }
                 Err(e) => sidebar_error.set(Some(e)),
             }
@@ -170,6 +254,30 @@ pub fn Sidebar(
                 }}
 
                 // ============================================================
+                // 1.5 Global Search Trigger Button (Ctrl+K / Cmd+K)
+                // ============================================================
+                <div class="px-3 pt-3">
+                    <button
+                        type="button"
+                        title="Global Scoped Search (Ctrl+K)"
+                        on:click=move |_| on_open_search_modal.run(())
+                        class="w-full px-2.5 py-2 rounded-xl bg-[#14171A] hover:bg-[#1E2227] border border-[#2A2F37] hover:border-[#06B6D4]/50 text-xs text-slate-300 flex items-center justify-between gap-2 transition"
+                    >
+                        <div class="flex items-center gap-2 truncate">
+                            <span class="text-[#06B6D4]">"🔍"</span>
+                            <Show when=move || !auth.sidebar_collapsed.get()>
+                                <span class="truncate">"Search Workspace..."</span>
+                            </Show>
+                        </div>
+                        <Show when=move || !auth.sidebar_collapsed.get()>
+                            <span class="px-1.5 py-0.5 rounded bg-slate-800/80 border border-slate-700 text-[10px] font-mono text-slate-400 shrink-0">
+                                "Ctrl+K"
+                            </span>
+                        </Show>
+                    </button>
+                </div>
+
+                // ============================================================
                 // 2. Spaces Tree Navigation (Accordion + Grids + Actions)
                 // ============================================================
                 <Show when=move || !auth.sidebar_collapsed.get()>
@@ -248,21 +356,31 @@ pub fn Sidebar(
                                                                 .cloned()
                                                                 .unwrap_or_default();
 
-                                                            grids
+                                                            let space_grid_ids: Vec<Uuid> =
+                                                                grids.iter().map(|g| g.id).collect();
+                                                            let selected_in_space: Vec<Uuid> = {
+                                                                let sel = selected_sidebar_grids.get();
+                                                                space_grid_ids
+                                                                    .iter()
+                                                                    .copied()
+                                                                    .filter(|id| sel.contains(id))
+                                                                    .collect()
+                                                            };
+                                                            let has_selection_in_space = !selected_in_space.is_empty();
+                                                            let all_selected_in_space = !space_grid_ids.is_empty()
+                                                                && selected_in_space.len() == space_grid_ids.len();
+
+                                                            let grid_rows_view = grids
                                                                 .into_iter()
                                                                 .map(|grid| {
                                                                     let gid = grid.id;
                                                                     let gtitle = grid.title.clone();
                                                                     let target_route = format!("/spaces/{space_id}/grids/{gid}");
                                                                     let target_route_click = target_route.clone();
+                                                                    let is_checked = selected_sidebar_grids.get().contains(&gid);
+
                                                                     view! {
-                                                                        <button
-                                                                            type="button"
-                                                                            on:click=move |_| {
-                                                                                auth.active_space_id.set(Some(space_id));
-                                                                                auth.active_grid_id.set(Some(gid));
-                                                                                on_navigate.run(target_route_click.clone());
-                                                                            }
+                                                                        <div
                                                                             class=move || {
                                                                                 let is_selected = auth.active_grid_id.get() == Some(gid)
                                                                                     || current_path.get() == target_route;
@@ -271,15 +389,186 @@ pub fn Sidebar(
                                                                                 } else {
                                                                                     "text-slate-400 hover:text-slate-200 hover:bg-slate-500/10"
                                                                                 };
-                                                                                format!("w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center gap-2 transition {cls}")
+                                                                                format!("group/grid w-full px-2 py-1.5 rounded text-xs flex items-center justify-between gap-1.5 transition {cls}")
                                                                             }
                                                                         >
-                                                                            <span class="text-[#06B6D4]">"⊞"</span>
-                                                                            <span class="truncate">{gtitle}</span>
-                                                                        </button>
+                                                                            <div class="flex items-center gap-1.5 min-w-0 flex-1">
+                                                                                <Show when=move || can_create_or_edit>
+                                                                                    <input
+                                                                                        type="checkbox"
+                                                                                        prop:checked=is_checked
+                                                                                        on:click=move |ev| {
+                                                                                            ev.stop_propagation();
+                                                                                            selected_sidebar_grids.update(|set| {
+                                                                                                if set.contains(&gid) {
+                                                                                                    set.remove(&gid);
+                                                                                                } else {
+                                                                                                    set.insert(gid);
+                                                                                                }
+                                                                                            });
+                                                                                        }
+                                                                                        class=if has_selection_in_space || is_checked {
+                                                                                            "h-3.5 w-3.5 rounded accent-[#F97316] cursor-pointer shrink-0 opacity-100 transition-opacity"
+                                                                                        } else {
+                                                                                            "h-3.5 w-3.5 rounded accent-[#F97316] cursor-pointer shrink-0 opacity-0 group-hover/grid:opacity-100 transition-opacity"
+                                                                                        }
+                                                                                    />
+                                                                                </Show>
+                                                                                <button
+                                                                                    type="button"
+                                                                                    on:click=move |_| {
+                                                                                        auth.active_space_id.set(Some(space_id));
+                                                                                        auth.active_grid_id.set(Some(gid));
+                                                                                        on_navigate.run(target_route_click.clone());
+                                                                                    }
+                                                                                    class="flex items-center gap-1.5 min-w-0 flex-1 text-left truncate"
+                                                                                >
+                                                                                    <span class="text-[#06B6D4] shrink-0">"⊞"</span>
+                                                                                    <span class="truncate">{gtitle}</span>
+                                                                                </button>
+                                                                            </div>
+
+                                                                            <Show when=move || can_create_or_edit>
+                                                                                {move || {
+                                                                                    if confirming_delete_grid_id.get() == Some(gid) {
+                                                                                        view! {
+                                                                                            <div
+                                                                                                class="flex items-center gap-1 shrink-0"
+                                                                                                on:click=move |ev| ev.stop_propagation()
+                                                                                            >
+                                                                                                <button
+                                                                                                    type="button"
+                                                                                                    title="Confirm Delete Grid"
+                                                                                                    on:click=move |ev| {
+                                                                                                        ev.stop_propagation();
+                                                                                                        handle_single_delete_grid(space_id, gid);
+                                                                                                    }
+                                                                                                    class="px-1.5 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold"
+                                                                                                >
+                                                                                                    "Del"
+                                                                                                </button>
+                                                                                                <button
+                                                                                                    type="button"
+                                                                                                    title="Cancel"
+                                                                                                    on:click=move |ev| {
+                                                                                                        ev.stop_propagation();
+                                                                                                        confirming_delete_grid_id.set(None);
+                                                                                                    }
+                                                                                                    class="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
+                                                                                                >
+                                                                                                    "×"
+                                                                                                </button>
+                                                                                            </div>
+                                                                                        }
+                                                                                        .into_any()
+                                                                                    } else {
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                title="Delete Grid"
+                                                                                                on:click=move |ev| {
+                                                                                                    ev.stop_propagation();
+                                                                                                    confirming_delete_grid_id.set(Some(gid));
+                                                                                                }
+                                                                                                class="opacity-0 group-hover/grid:opacity-100 p-0.5 rounded hover:bg-red-500/20 text-slate-400 hover:text-red-400 text-[11px] transition shrink-0"
+                                                                                            >
+                                                                                                "🗑️"
+                                                                                            </button>
+                                                                                        }
+                                                                                        .into_any()
+                                                                                    }
+                                                                                }}
+                                                                            </Show>
+                                                                        </div>
                                                                     }
                                                                 })
-                                                                .collect_view()
+                                                                .collect_view();
+
+                                                            let selected_for_bar = selected_in_space.clone();
+                                                            let space_ids_for_toggle = space_grid_ids.clone();
+
+                                                            view! {
+                                                                <div class="space-y-1">
+                                                                    {grid_rows_view}
+
+                                                                    // Compact Bulk Selection Bar when 1+ Grids are selected in this Space
+                                                                    <Show when=move || can_create_or_edit && has_selection_in_space>
+                                                                        {
+                                                                            let sel_ids = selected_for_bar.clone();
+                                                                            let all_ids = space_ids_for_toggle.clone();
+                                                                            let count = sel_ids.len();
+                                                                            view! {
+                                                                                <div class="mt-1.5 p-2 rounded-lg bg-red-950/30 border border-red-500/30 flex flex-col gap-1.5">
+                                                                                    <div class="flex items-center justify-between text-[11px]">
+                                                                                        <span class="font-semibold text-red-300">
+                                                                                            {format!("{count} grid{} selected", if count == 1 { "" } else { "s" })}
+                                                                                        </span>
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            on:click=move |_| {
+                                                                                                let ids = all_ids.clone();
+                                                                                                selected_sidebar_grids.update(|set| {
+                                                                                                    if all_selected_in_space {
+                                                                                                        for id in &ids {
+                                                                                                            set.remove(id);
+                                                                                                        }
+                                                                                                    } else {
+                                                                                                        for id in ids {
+                                                                                                            set.insert(id);
+                                                                                                        }
+                                                                                                    }
+                                                                                                });
+                                                                                            }
+                                                                                            class="text-[10px] font-semibold text-[#06B6D4] hover:underline"
+                                                                                        >
+                                                                                            {if all_selected_in_space { "Clear" } else { "Select All" }}
+                                                                                        </button>
+                                                                                    </div>
+
+                                                                                    {move || {
+                                                                                        let ids_to_del = sel_ids.clone();
+                                                                                        if confirming_bulk_delete_space_id.get() == Some(space_id) {
+                                                                                            view! {
+                                                                                                <div class="flex items-center gap-1">
+                                                                                                    <button
+                                                                                                        type="button"
+                                                                                                        on:click=move |_| {
+                                                                                                            handle_bulk_delete_space_grids(space_id, ids_to_del.clone());
+                                                                                                        }
+                                                                                                        class="flex-1 py-1 rounded bg-red-600 hover:bg-red-500 text-white text-[11px] font-bold transition"
+                                                                                                    >
+                                                                                                        "Confirm Delete"
+                                                                                                    </button>
+                                                                                                    <button
+                                                                                                        type="button"
+                                                                                                        on:click=move |_| confirming_bulk_delete_space_id.set(None)
+                                                                                                        class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                                                                                                    >
+                                                                                                        "Cancel"
+                                                                                                    </button>
+                                                                                                </div>
+                                                                                            }
+                                                                                            .into_any()
+                                                                                        } else {
+                                                                                            view! {
+                                                                                                <button
+                                                                                                    type="button"
+                                                                                                    on:click=move |_| confirming_bulk_delete_space_id.set(Some(space_id))
+                                                                                                    class="w-full py-1 px-2 rounded bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-300 text-[11px] font-semibold flex items-center justify-center gap-1 transition"
+                                                                                                >
+                                                                                                    <span>"🗑️"</span>
+                                                                                                    <span>"Delete Selected"</span>
+                                                                                                </button>
+                                                                                            }
+                                                                                            .into_any()
+                                                                                        }
+                                                                                    }}
+                                                                                </div>
+                                                                            }
+                                                                        }
+                                                                    </Show>
+                                                                </div>
+                                                            }
                                                         }}
 
                                                         // Conditional `+ New Grid` & `Import from Notion / AppFlowy` buttons

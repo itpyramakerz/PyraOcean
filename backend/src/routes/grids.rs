@@ -1,5 +1,5 @@
 use crate::auth::{
-    record_audit_log, resolve_grid_access, resolve_space_access, AppState, AuthError,
+    record_audit_log, resolve_grid_access_cached, resolve_space_access_cached, AppState, AuthError,
     RequireSpaceAccess,
 };
 use axum::{
@@ -9,12 +9,13 @@ use axum::{
 };
 use chrono::{NaiveDate, NaiveTime, Utc};
 use pyra_ocean_shared::{
-    BulkDeleteRowsRequest, BulkDeleteRowsResponse, BulkPatchCellsRequest, CellValue, ChecklistItem,
-    ColumnPropertyConfig, ColumnPropertyType, CreateColumnRequest, CreateGridRequest,
-    CreateRowRequest, FileAttachment, FilterOperator, GridColumn, GridHistoryEntry, GridRow,
-    GridSchemaResponse, GridSnapshotData, PageGrid, PatchRowRequest, ReorderColumnsRequest,
-    ReorderRowsRequest, RestoreGridHistoryResponse, RestoreRowsRequest, RowCellMap, SelectOption,
-    SortDirection, TagColor, UpdateColumnRequest, UpdateGridRequest,
+    BulkDeleteGridsRequest, BulkDeleteGridsResponse, BulkDeleteRowsRequest, BulkDeleteRowsResponse,
+    BulkPatchCellsRequest, CellValue, ChecklistItem, ColumnPropertyConfig, ColumnPropertyType,
+    CreateColumnRequest, CreateGridRequest, CreateRowRequest, FileAttachment, FilterOperator,
+    GridColumn, GridHistoryDetail, GridHistoryEntry, GridRow, GridSchemaResponse, GridSnapshotData,
+    PageGrid, PatchRowRequest, ReorderColumnsRequest, ReorderRowsRequest,
+    RestoreGridHistoryResponse, RestoreRowsRequest, RowCellMap, SelectOption, SortDirection,
+    TagColor, UpdateColumnRequest, UpdateGridRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -63,7 +64,11 @@ pub async fn list_space_grids(
     RequireSpaceAccess(user): RequireSpaceAccess,
     Path(space_id): Path<Uuid>,
 ) -> Result<Json<Vec<PageGrid>>, AuthError> {
-    let _access = resolve_space_access(&state.db, user, space_id).await?;
+    let _access = resolve_space_access_cached(&state, user, space_id).await?;
+
+    if let Some(cached) = state.cache.get_space_grids(&space_id) {
+        return Ok(Json(cached));
+    }
 
     let grids: Vec<PageGrid> = sqlx::query_as(
         r#"
@@ -77,6 +82,7 @@ pub async fn list_space_grids(
     .fetch_all(&state.db)
     .await?;
 
+    state.cache.set_space_grids(space_id, grids.clone());
     Ok(Json(grids))
 }
 
@@ -88,7 +94,7 @@ pub async fn create_grid(
     Path(space_id): Path<Uuid>,
     Json(payload): Json<CreateGridRequest>,
 ) -> Result<(StatusCode, Json<GridSchemaResponse>), AuthError> {
-    let access = resolve_space_access(&state.db, user.clone(), space_id).await?;
+    let access = resolve_space_access_cached(&state, user.clone(), space_id).await?;
     access.ensure_write()?;
 
     if payload.title.trim().is_empty() {
@@ -144,6 +150,13 @@ pub async fn create_grid(
 
     tx.commit().await?;
 
+    let schema = GridSchemaResponse {
+        grid: grid.clone(),
+        columns: vec![col_primary, col_last_mod],
+    };
+    state.cache.invalidate_space(&space_id);
+    state.cache.set_grid_schema(grid.id, schema.clone());
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -154,13 +167,7 @@ pub async fn create_grid(
     )
     .await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(GridSchemaResponse {
-            grid,
-            columns: vec![col_primary, col_last_mod],
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(schema)))
 }
 
 pub fn default_config_for_type(prop_type: ColumnPropertyType) -> ColumnPropertyConfig {
@@ -202,13 +209,17 @@ pub fn default_config_for_type(prop_type: ColumnPropertyType) -> ColumnPropertyC
 }
 
 /// `GET /api/grids/{grid_id}`
-/// Returns the `PageGrid` metadata and ordered `Vec<GridColumn>` schema.
+/// Returns the `PageGrid` metadata and ordered `Vec<GridColumn>` schema (served from `AppCache` when fresh).
 pub async fn get_grid_schema(
     State(state): State<AppState>,
     RequireSpaceAccess(user): RequireSpaceAccess,
     Path(grid_id): Path<Uuid>,
 ) -> Result<Json<GridSchemaResponse>, AuthError> {
-    let _access = resolve_grid_access(&state.db, user, grid_id).await?;
+    let _access = resolve_grid_access_cached(&state, user, grid_id).await?;
+
+    if let Some(cached) = state.cache.get_grid_schema(&grid_id) {
+        return Ok(Json(cached));
+    }
 
     let grid: PageGrid = sqlx::query_as(
         r#"
@@ -234,7 +245,9 @@ pub async fn get_grid_schema(
     .fetch_all(&state.db)
     .await?;
 
-    Ok(Json(GridSchemaResponse { grid, columns }))
+    let schema = GridSchemaResponse { grid, columns };
+    state.cache.set_grid_schema(grid_id, schema.clone());
+    Ok(Json(schema))
 }
 
 /// `PATCH /api/grids/{grid_id}`
@@ -245,7 +258,7 @@ pub async fn update_grid(
     Path(grid_id): Path<Uuid>,
     Json(payload): Json<UpdateGridRequest>,
 ) -> Result<Json<PageGrid>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let existing: PageGrid = sqlx::query_as(
@@ -295,6 +308,8 @@ pub async fn update_grid(
     .fetch_one(&state.db)
     .await?;
 
+    state.cache.invalidate_grid(&grid_id);
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -308,6 +323,84 @@ pub async fn update_grid(
     Ok(Json(updated))
 }
 
+/// `DELETE /api/grids/{grid_id}`
+/// Hard-deletes a single Grid Page (`ON DELETE CASCADE` cleans up `grid_columns`, `grid_rows`,
+/// and `grid_history_snapshots`), invalidates `AppCache`, and records an async audit log entry.
+pub async fn delete_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+) -> Result<StatusCode, AuthError> {
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let result = sqlx::query("DELETE FROM pages_grids WHERE id = $1")
+        .bind(grid_id)
+        .execute(&state.db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AuthError::NotFound(format!("Grid {grid_id} not found")));
+    }
+
+    state.cache.invalidate_grid(&grid_id);
+    state.cache.invalidate_space(&access.space_id);
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.delete",
+        json!({ "deleted_grid_id": grid_id }),
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/spaces/{space_id}/grids/bulk`
+/// Atomically deletes multiple Grids within a Space (`DELETE FROM pages_grids WHERE space_id = $1 AND id = ANY($2)`),
+/// invalidates the in-memory cache for all deleted `grid_ids`, and returns `BulkDeleteGridsResponse`.
+pub async fn bulk_delete_grids(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(space_id): Path<Uuid>,
+    Json(payload): Json<BulkDeleteGridsRequest>,
+) -> Result<Json<BulkDeleteGridsResponse>, AuthError> {
+    let access = resolve_space_access_cached(&state, user.clone(), space_id).await?;
+    access.ensure_write()?;
+
+    if payload.grid_ids.is_empty() {
+        return Ok(Json(BulkDeleteGridsResponse { deleted_count: 0 }));
+    }
+
+    let result = sqlx::query("DELETE FROM pages_grids WHERE space_id = $1 AND id = ANY($2)")
+        .bind(space_id)
+        .bind(&payload.grid_ids)
+        .execute(&state.db)
+        .await?;
+
+    let deleted_count = result.rows_affected();
+
+    for gid in &payload.grid_ids {
+        state.cache.invalidate_grid(gid);
+    }
+    state.cache.invalidate_space(&space_id);
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(space_id),
+        None,
+        "grid.bulk_delete",
+        json!({ "deleted_count": deleted_count, "grid_ids": payload.grid_ids }),
+    )
+    .await?;
+
+    Ok(Json(BulkDeleteGridsResponse { deleted_count }))
+}
+
 /// `POST /api/grids/{grid_id}/columns`
 pub async fn create_column(
     State(state): State<AppState>,
@@ -315,7 +408,7 @@ pub async fn create_column(
     Path(grid_id): Path<Uuid>,
     Json(payload): Json<CreateColumnRequest>,
 ) -> Result<(StatusCode, Json<GridColumn>), AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     if payload.name.trim().is_empty() {
@@ -354,6 +447,8 @@ pub async fn create_column(
     .fetch_one(&state.db)
     .await?;
 
+    state.cache.invalidate_grid(&grid_id);
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -385,7 +480,7 @@ pub async fn reorder_columns(
     Path(grid_id): Path<Uuid>,
     Json(payload): Json<ReorderColumnsRequest>,
 ) -> Result<Json<Vec<GridColumn>>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let mut tx = state.db.begin().await?;
@@ -415,6 +510,8 @@ pub async fn reorder_columns(
 
     tx.commit().await?;
 
+    state.cache.invalidate_grid(&grid_id);
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -437,7 +534,7 @@ pub async fn update_column(
     Path((grid_id, col_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<UpdateColumnRequest>,
 ) -> Result<Json<GridColumn>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let mut tx = state.db.begin().await?;
@@ -645,6 +742,8 @@ pub async fn update_column(
 
     tx.commit().await?;
 
+    state.cache.invalidate_grid(&grid_id);
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -680,7 +779,7 @@ pub async fn delete_column(
     RequireSpaceAccess(user): RequireSpaceAccess,
     Path((grid_id, col_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let mut tx = state.db.begin().await?;
@@ -705,6 +804,8 @@ pub async fn delete_column(
         .await?;
 
     tx.commit().await?;
+
+    state.cache.invalidate_grid(&grid_id);
 
     record_audit_log(
         &state.db,
@@ -925,18 +1026,22 @@ pub async fn list_rows(
     Path(grid_id): Path<Uuid>,
     Query(query): Query<ListRowsQuery>,
 ) -> Result<Json<Vec<GridRow>>, AuthError> {
-    let _access = resolve_grid_access(&state.db, user, grid_id).await?;
+    let _access = resolve_grid_access_cached(&state, user, grid_id).await?;
 
-    let columns: Vec<GridColumn> = sqlx::query_as(
-        r#"
-        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
-        FROM grid_columns
-        WHERE grid_id = $1
-        "#,
-    )
-    .bind(grid_id)
-    .fetch_all(&state.db)
-    .await?;
+    let columns: Vec<GridColumn> = if let Some(cached_cols) = state.cache.get_grid_columns(&grid_id) {
+        cached_cols
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+            FROM grid_columns
+            WHERE grid_id = $1
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&state.db)
+        .await?
+    };
 
     let col_map: HashMap<Uuid, GridColumn> = columns.into_iter().map(|c| (c.id, c)).collect();
 
@@ -1107,20 +1212,24 @@ pub async fn list_rows(
 }
 
 async fn validate_and_stamp_cells(
-    db: &sqlx::PgPool,
+    state: &AppState,
     grid_id: Uuid,
     cells: &mut RowCellMap,
 ) -> Result<(), AuthError> {
-    let columns: Vec<GridColumn> = sqlx::query_as(
-        r#"
-        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
-        FROM grid_columns
-        WHERE grid_id = $1
-        "#,
-    )
-    .bind(grid_id)
-    .fetch_all(db)
-    .await?;
+    let columns: Vec<GridColumn> = if let Some(cached_cols) = state.cache.get_grid_columns(&grid_id) {
+        cached_cols
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+            FROM grid_columns
+            WHERE grid_id = $1
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&state.db)
+        .await?
+    };
 
     let col_map: HashMap<Uuid, GridColumn> = columns.into_iter().map(|c| (c.id, c)).collect();
 
@@ -1150,19 +1259,66 @@ pub async fn create_row(
     Path(grid_id): Path<Uuid>,
     Json(mut payload): Json<CreateRowRequest>,
 ) -> Result<(StatusCode, Json<GridRow>), AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
-    validate_and_stamp_cells(&state.db, grid_id, &mut payload.cells).await?;
+    validate_and_stamp_cells(&state, grid_id, &mut payload.cells).await?;
 
-    let (next_pos, max_ord): (i32, f64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(position) + 1, 0), COALESCE(MAX(row_order) + 1000.0, 1000.0) FROM grid_rows WHERE grid_id = $1",
-    )
-    .bind(grid_id)
-    .fetch_one(&state.db)
-    .await?;
+    let mut tx = state.db.begin().await?;
 
-    let row_order = payload.row_order.unwrap_or(max_ord);
+    // Resolve optional positional insertion (`target_row_id` + `placement` or `insert_at_position`)
+    let mut resolved_insert_pos: Option<i32> = payload.insert_at_position.map(|p| p.max(0));
+    if let Some(target_row_id) = payload.target_row_id {
+        let maybe_target_pos: Option<i32> = sqlx::query_scalar(
+            "SELECT position FROM grid_rows WHERE id = $1 AND grid_id = $2",
+        )
+        .bind(target_row_id)
+        .bind(grid_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(t_pos) = maybe_target_pos {
+            let is_above = payload
+                .placement
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("above"))
+                .unwrap_or(false);
+            resolved_insert_pos = Some(if is_above {
+                t_pos.max(0)
+            } else {
+                (t_pos + 1).max(0)
+            });
+        }
+    }
+
+    let (target_pos, row_order) = if let Some(insert_pos) = resolved_insert_pos {
+        // Shift subsequent rows down by 1 inside the transaction
+        sqlx::query(
+            r#"
+            UPDATE grid_rows
+            SET position = position + 1,
+                row_order = (position + 1)::double precision * 1000.0
+            WHERE grid_id = $1 AND position >= $2
+            "#,
+        )
+        .bind(grid_id)
+        .bind(insert_pos)
+        .execute(&mut *tx)
+        .await?;
+
+        let ord = payload.row_order.unwrap_or((insert_pos as f64) * 1000.0);
+        (insert_pos, ord)
+    } else {
+        let (next_pos, max_ord): (i32, f64) = sqlx::query_as(
+            "SELECT COALESCE(MAX(position) + 1, 0), COALESCE(MAX(row_order) + 1000.0, 1000.0) FROM grid_rows WHERE grid_id = $1",
+        )
+        .bind(grid_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let ord = payload.row_order.unwrap_or(max_ord);
+        (next_pos, ord)
+    };
 
     let row: GridRow = sqlx::query_as(
         r#"
@@ -1172,12 +1328,20 @@ pub async fn create_row(
         "#,
     )
     .bind(grid_id)
-    .bind(next_pos)
+    .bind(target_pos)
     .bind(row_order)
     .bind(sqlx::types::Json(&payload.cells))
     .bind(user.user_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
+
+    let summary_msg = if let Some(p) = resolved_insert_pos {
+        format!("Inserted new row at position {}", p + 1)
+    } else {
+        "Created new row".to_string()
+    };
 
     let _ = record_grid_history_snapshot(
         &state.db,
@@ -1185,7 +1349,7 @@ pub async fn create_row(
         "row.create",
         Some(user.user_id),
         Some(&user.email),
-        "Created new row",
+        &summary_msg,
     )
     .await;
 
@@ -1198,10 +1362,10 @@ pub async fn update_row(
     Path((grid_id, row_id)): Path<(Uuid, Uuid)>,
     Json(mut payload): Json<PatchRowRequest>,
 ) -> Result<Json<GridRow>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
-    validate_and_stamp_cells(&state.db, grid_id, &mut payload.cells).await?;
+    validate_and_stamp_cells(&state, grid_id, &mut payload.cells).await?;
 
     let updated: GridRow = sqlx::query_as(
         r#"
@@ -1245,7 +1409,7 @@ pub async fn bulk_update_row_cells(
     Path(grid_id): Path<Uuid>,
     Json(mut payload): Json<BulkPatchCellsRequest>,
 ) -> Result<Json<Vec<GridRow>>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     if payload.updates.is_empty() {
@@ -1253,7 +1417,7 @@ pub async fn bulk_update_row_cells(
     }
 
     for item in &mut payload.updates {
-        validate_and_stamp_cells(&state.db, grid_id, &mut item.cells).await?;
+        validate_and_stamp_cells(&state, grid_id, &mut item.cells).await?;
     }
 
     let mut tx = state.db.begin().await?;
@@ -1313,7 +1477,7 @@ pub async fn bulk_delete_rows(
     Path(grid_id): Path<Uuid>,
     Json(payload): Json<BulkDeleteRowsRequest>,
 ) -> Result<Json<BulkDeleteRowsResponse>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     if payload.row_ids.is_empty() {
@@ -1361,7 +1525,7 @@ pub async fn reorder_rows(
     Path(grid_id): Path<Uuid>,
     Json(payload): Json<ReorderRowsRequest>,
 ) -> Result<Json<Vec<GridRow>>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let mut tx = state.db.begin().await?;
@@ -1415,7 +1579,7 @@ pub async fn restore_rows(
     Path(grid_id): Path<Uuid>,
     Json(payload): Json<RestoreRowsRequest>,
 ) -> Result<Json<Vec<GridRow>>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let mut tx = state.db.begin().await?;
@@ -1479,7 +1643,7 @@ pub async fn reset_grid_layout(
     RequireSpaceAccess(user): RequireSpaceAccess,
     Path(grid_id): Path<Uuid>,
 ) -> Result<Json<Vec<GridColumn>>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let columns: Vec<GridColumn> = sqlx::query_as(
@@ -1497,6 +1661,8 @@ pub async fn reset_grid_layout(
     let mut sorted = columns;
     sorted.sort_by_key(|c| (c.position, c.created_at));
 
+    state.cache.invalidate_grid(&grid_id);
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -1510,7 +1676,9 @@ pub async fn reset_grid_layout(
     Ok(Json(sorted))
 }
 
-/// Records a point-in-time snapshot into `grid_history_snapshots` and purges snapshots older than 30 days.
+/// Asynchronously records a point-in-time snapshot into `grid_history_snapshots` and purges snapshots
+/// older than 30 days in a non-blocking `tokio::spawn` background task so interactive cell/column edits
+/// return to the client immediately.
 pub async fn record_grid_history_snapshot(
     db: &sqlx::PgPool,
     grid_id: Uuid,
@@ -1519,56 +1687,68 @@ pub async fn record_grid_history_snapshot(
     actor_email: Option<&str>,
     summary: &str,
 ) -> Result<(), AuthError> {
-    let columns: Vec<GridColumn> = sqlx::query_as(
-        r#"
-        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
-        FROM grid_columns
-        WHERE grid_id = $1
-        ORDER BY position ASC, created_at ASC
-        "#,
-    )
-    .bind(grid_id)
-    .fetch_all(db)
-    .await?;
+    let db_clone = db.clone();
+    let action_owned = action_type.to_string();
+    let email_owned = actor_email.map(|s| s.to_string());
+    let summary_owned = summary.to_string();
 
-    let rows: Vec<GridRow> = sqlx::query_as(
-        r#"
-        SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
-        FROM grid_rows
-        WHERE grid_id = $1
-        ORDER BY position ASC, row_order ASC, created_at ASC
-        "#,
-    )
-    .bind(grid_id)
-    .fetch_all(db)
-    .await?;
+    tokio::spawn(async move {
+        let Ok(columns) = sqlx::query_as::<_, GridColumn>(
+            r#"
+            SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+            FROM grid_columns
+            WHERE grid_id = $1
+            ORDER BY position ASC, created_at ASC
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&db_clone)
+        .await
+        else {
+            return;
+        };
 
-    let snapshot = GridSnapshotData {
-        columns,
-        rows,
-        summary: summary.to_string(),
-    };
+        let Ok(rows) = sqlx::query_as::<_, GridRow>(
+            r#"
+            SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            FROM grid_rows
+            WHERE grid_id = $1
+            ORDER BY position ASC, row_order ASC, created_at ASC
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&db_clone)
+        .await
+        else {
+            return;
+        };
 
-    sqlx::query(
-        r#"
-        INSERT INTO grid_history_snapshots (grid_id, action_type, actor_user_id, actor_email, snapshot_data)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(grid_id)
-    .bind(action_type)
-    .bind(actor_user_id)
-    .bind(actor_email)
-    .bind(sqlx::types::Json(&snapshot))
-    .execute(db)
-    .await?;
+        let snapshot = GridSnapshotData {
+            columns,
+            rows,
+            summary: summary_owned,
+        };
 
-    // Automatic 30-day retention cleanup
-    sqlx::query(
-        "DELETE FROM grid_history_snapshots WHERE created_at < NOW() - INTERVAL '30 days'",
-    )
-    .execute(db)
-    .await?;
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO grid_history_snapshots (grid_id, action_type, actor_user_id, actor_email, snapshot_data)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(grid_id)
+        .bind(&action_owned)
+        .bind(actor_user_id)
+        .bind(email_owned.as_deref())
+        .bind(sqlx::types::Json(&snapshot))
+        .execute(&db_clone)
+        .await;
+
+        let _ = sqlx::query(
+            "DELETE FROM grid_history_snapshots WHERE created_at < NOW() - INTERVAL '30 days'",
+        )
+        .execute(&db_clone)
+        .await;
+    });
 
     Ok(())
 }
@@ -1580,7 +1760,7 @@ pub async fn list_grid_history(
     RequireSpaceAccess(user): RequireSpaceAccess,
     Path(grid_id): Path<Uuid>,
 ) -> Result<Json<Vec<GridHistoryEntry>>, AuthError> {
-    let _access = resolve_grid_access(&state.db, user, grid_id).await?;
+    let _access = resolve_grid_access_cached(&state, user, grid_id).await?;
 
     // Purge expired snapshots older than 30 days
     let _ = sqlx::query(
@@ -1615,6 +1795,60 @@ pub async fn list_grid_history(
     Ok(Json(entries))
 }
 
+/// `GET /api/grids/{grid_id}/history/{history_id}`
+/// Returns the full `GridHistoryDetail` including `snapshot_data` (`columns` and `rows`) for the Full-Page History Preview Modal.
+pub async fn get_grid_history_detail(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((grid_id, history_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<GridHistoryDetail>, AuthError> {
+    let _access = resolve_grid_access_cached(&state, user, grid_id).await?;
+
+    let row_opt: Option<(
+        Uuid,
+        Uuid,
+        String,
+        Option<Uuid>,
+        Option<String>,
+        sqlx::types::Json<GridSnapshotData>,
+        chrono::DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, action_type, actor_user_id, actor_email, snapshot_data, created_at
+        FROM grid_history_snapshots
+        WHERE id = $1 AND grid_id = $2
+        "#,
+    )
+    .bind(history_id)
+    .bind(grid_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (id, grid_id, action_type, actor_user_id, actor_email, sqlx::types::Json(snapshot_data), created_at) =
+        row_opt.ok_or_else(|| {
+            AuthError::NotFound(format!(
+                "History snapshot {history_id} not found for grid {grid_id}"
+            ))
+        })?;
+
+    let summary = if snapshot_data.summary.trim().is_empty() {
+        action_type.clone()
+    } else {
+        snapshot_data.summary.clone()
+    };
+
+    Ok(Json(GridHistoryDetail {
+        id,
+        grid_id,
+        action_type,
+        actor_user_id,
+        actor_email,
+        summary,
+        created_at,
+        snapshot_data,
+    }))
+}
+
 /// `POST /api/grids/{grid_id}/history/{history_id}/restore`
 /// Restores a Grid's columns and rows to an exact historical point-in-time snapshot.
 pub async fn restore_grid_history(
@@ -1622,7 +1856,7 @@ pub async fn restore_grid_history(
     RequireSpaceAccess(user): RequireSpaceAccess,
     Path((grid_id, history_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<RestoreGridHistoryResponse>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let row_opt: Option<(sqlx::types::Json<GridSnapshotData>,)> = sqlx::query_as(
@@ -1714,6 +1948,8 @@ pub async fn restore_grid_history(
 
     tx.commit().await?;
 
+    state.cache.invalidate_grid(&grid_id);
+
     record_audit_log(
         &state.db,
         user.user_id,
@@ -1747,7 +1983,7 @@ pub async fn upload_cell_file(
     Path((grid_id, row_id)): Path<(Uuid, Uuid)>,
     mut multipart: Multipart,
 ) -> Result<Json<GridRow>, AuthError> {
-    let access = resolve_grid_access(&state.db, user.clone(), grid_id).await?;
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
     let target_dir = state

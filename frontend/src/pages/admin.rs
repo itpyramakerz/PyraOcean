@@ -584,7 +584,7 @@ pub fn AdminDashboard(initial_tab: RwSignal<AdminTab>) -> impl IntoView {
                                     .map(|item| {
                                         let sid = item.space.id;
                                         let sname = item.space.name.clone();
-                                        let sname_del = StoredValue::new(sname.clone());
+                                        let sname_del = sname.clone();
                                         let sslug = item.space.slug.clone();
                                         let role = item.effective_role;
 
@@ -609,17 +609,22 @@ pub fn AdminDashboard(initial_tab: RwSignal<AdminTab>) -> impl IntoView {
                                                 </div>
 
                                                 <Show when=move || auth.is_super_admin()>
-                                                    <button
-                                                        type="button"
-                                                        title="Hard Delete Space & Cascade Grids"
-                                                        on:click=move |ev| {
-                                                            ev.stop_propagation();
-                                                            handle_delete_space(sid, sname_del.get_value());
+                                                    {
+                                                        let sname_for_btn = sname_del.clone();
+                                                        view! {
+                                                            <button
+                                                                type="button"
+                                                                title="Hard Delete Space & Cascade Grids"
+                                                                on:click=move |ev| {
+                                                                    ev.stop_propagation();
+                                                                    handle_delete_space(sid, sname_for_btn.clone());
+                                                                }
+                                                                class="px-2 py-1 rounded bg-red-500/10 hover:bg-red-500/25 text-red-400 text-[11px] font-semibold"
+                                                            >
+                                                                "Delete"
+                                                            </button>
                                                         }
-                                                        class="px-2 py-1 rounded bg-red-500/10 hover:bg-red-500/25 text-red-400 text-[11px] font-semibold"
-                                                    >
-                                                        "Delete"
-                                                    </button>
+                                                    }
                                                 </Show>
                                             </div>
                                         }

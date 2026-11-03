@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PyraOcean — Enterprise Workspace &amp; Dynamic Grid Engine</title>
     <link data-trunk rel="copy-dir" href="public" />
-    <link data-trunk rel="rust" data-wasm-opt="0" />
+    <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="0" />
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -28,6 +28,26 @@
             }
         };
     </script>
+    <style>
+        ::-webkit-scrollbar {
+            height: 10px;
+            width: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #14171A;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 5px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #06B6D4;
+        }
+        .custom-scrollbar {
+            scrollbar-width: thin;
+            scrollbar-color: #334155 #14171A;
+        }
+    </style>
 </head>
 <body class="bg-[#14171A] text-[#F1F5F9] antialiased selection:bg-orange-500/30 selection:text-orange-200">
 </body>
