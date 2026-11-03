@@ -1,8 +1,10 @@
 <div align="center">
 
+<img src="frontend/public/logo-dark.jpg" alt="PyraOcean Logo" width="120" height="120" style="border-radius: 18px;" />
+
 # 🌊 PyraOcean
 
-**A High-Performance, Self-Hosted Collaborative Workspace & Dynamic Database Platform Built 100% in Rust**
+**An Open source High-Performance, Self-Hosted Collaborative Workspace & Dynamic Database Platform Built 100% in Rust**
 
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Backend](https://img.shields.io/badge/Backend-Axum%20%2B%20SQLx-06B6D4)](https://github.com/tokio-rs/axum)
