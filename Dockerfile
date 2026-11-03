@@ -25,7 +25,7 @@ RUN cargo build --release --package pyra_ocean_backend
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates libssl3 curl && \
+    apt-get install -y --no-install-recommends ca-certificates libssl3 curl poppler-utils && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
