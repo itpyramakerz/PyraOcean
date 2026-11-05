@@ -49,6 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run embedded SQL migrations automatically on startup
     sqlx::migrate!("../migrations").run(&db).await?;
 
+    // Non-destructive startup migration: add `'password'` to PostgreSQL `column_property_type` enum
+    sqlx::query("ALTER TYPE column_property_type ADD VALUE IF NOT EXISTS 'password'")
+        .execute(&db)
+        .await?;
+
     // Ensure `grid_columns.width_px` defaults to 180px for interactive column resizing
     sqlx::query("ALTER TABLE grid_columns ADD COLUMN IF NOT EXISTS width_px INT DEFAULT 180")
         .execute(&db)
@@ -91,6 +96,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .execute(&db)
     .await?;
 
+    // Non-destructive startup migration for Notion-Style Soft-Delete / Trash on `pages_grids`
+    sqlx::query(
+        "ALTER TABLE pages_grids ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL",
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query(
+        "ALTER TABLE pages_grids ADD COLUMN IF NOT EXISTS deleted_by UUID REFERENCES users(id) ON DELETE SET NULL",
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pages_grids_deleted_at ON pages_grids (space_id, deleted_at)",
+    )
+    .execute(&db)
+    .await?;
+
+    // Auto-purge any soft-deleted grids older than 30 days on startup
+    sqlx::query(
+        "DELETE FROM pages_grids WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL '30 days'",
+    )
+    .execute(&db)
+    .await?;
+
+    // Phase 16: 2FA/TOTP & Password Recovery columns on `users`
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT NULL")
+        .execute(&db)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT DEFAULT NULL")
+        .execute(&db)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMPTZ DEFAULT NULL",
+    )
+    .execute(&db)
+    .await?;
+
+    // Phase 16: Row Comments table (`grid_row_comments`)
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS grid_row_comments (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            grid_id UUID NOT NULL REFERENCES pages_grids(id) ON DELETE CASCADE,
+            row_id UUID NOT NULL REFERENCES grid_rows(id) ON DELETE CASCADE,
+            author_id UUID REFERENCES users(id) ON DELETE SET NULL,
+            author_email TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_row_comments_row_id ON grid_row_comments (row_id, created_at ASC)",
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_row_comments_grid_id ON grid_row_comments (grid_id)",
+    )
+    .execute(&db)
+    .await?;
+
+    // Google OAuth2 & 2FA Authentication Settings singleton table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS system_auth_settings (
+            id INT PRIMARY KEY DEFAULT 1,
+            google_oauth_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            google_client_id TEXT NOT NULL DEFAULT '',
+            google_client_secret TEXT NOT NULL DEFAULT '',
+            google_allowed_domains TEXT NOT NULL DEFAULT '',
+            require_2fa_after_google BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query("INSERT INTO system_auth_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+        .execute(&db)
+        .await?;
+
+    // Phase 18: Local AI Copilot (`PyraAI` / Ollama) Settings singleton table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS system_ai_settings (
+            id INT PRIMARY KEY DEFAULT 1,
+            ai_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            ollama_base_url TEXT NOT NULL DEFAULT 'http://10.10.10.4:11434',
+            model_name TEXT NOT NULL DEFAULT 'qwen2.5:1.5b',
+            system_prompt TEXT NOT NULL DEFAULT 'You are PyraAI, the intelligent workspace assistant and task executor for PyraOcean.',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(&db)
+    .await?;
+
+    sqlx::query("INSERT INTO system_ai_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+        .execute(&db)
+        .await?;
+
     // Seed singleton SuperAdmin account if none exists
     bootstrap_super_admin(&db).await?;
 
@@ -112,17 +231,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Health & Branding
         .route("/api/health", get(health_check))
         .route("/api/v1/health", get(health_check))
-        // Authentication
+        // Authentication, 2FA/TOTP & Password Recovery
         .route("/api/auth/login", post(routes::admin::login_handler))
+        .route(
+            "/api/auth/public-config",
+            get(routes::admin::get_public_auth_config),
+        )
+        .route("/api/auth/google", post(routes::admin::google_login_handler))
         .route("/api/auth/me", get(routes::admin::current_user_profile))
-        // Module 1: SuperAdmin & Space RBAC Management API
+        .route(
+            "/api/auth/forgot-password/request",
+            post(routes::admin::request_password_reset_handler),
+        )
+        .route(
+            "/api/auth/forgot-password/reset",
+            post(routes::admin::self_service_reset_password_handler),
+        )
+        .route(
+            "/api/auth/password",
+            post(routes::admin::change_own_password_handler),
+        )
+        .route("/api/auth/2fa/setup", post(routes::admin::setup_totp_handler))
+        .route(
+            "/api/auth/2fa/enable",
+            post(routes::admin::enable_totp_handler),
+        )
+        .route(
+            "/api/auth/2fa/disable",
+            post(routes::admin::disable_totp_handler),
+        )
+        // Module 1: SuperAdmin, Backup/Restore, AI Settings & Space RBAC Management API
+        .route(
+            "/api/admin/auth-settings",
+            get(routes::admin::get_auth_settings).put(routes::admin::update_auth_settings),
+        )
+        .route(
+            "/api/admin/ai-settings",
+            get(routes::ai::get_ai_settings).put(routes::ai::update_ai_settings),
+        )
+        .route("/api/ai/status", get(routes::ai::get_ai_status))
+        .route("/api/ai/copilot", post(routes::ai::run_ai_copilot))
         .route(
             "/api/admin/users",
             get(routes::admin::list_users).post(routes::admin::create_user),
         )
         .route(
+            "/api/admin/users/{id}",
+            delete(routes::admin::delete_user),
+        )
+        .route(
             "/api/admin/users/{id}/role",
             patch(routes::admin::update_user_role),
+        )
+        .route(
+            "/api/admin/users/{id}/password",
+            post(routes::admin::admin_reset_user_password),
+        )
+        .route(
+            "/api/admin/users/{id}/2fa",
+            post(routes::admin::admin_manage_user_2fa),
+        )
+        .route(
+            "/api/admin/backup",
+            get(routes::admin::export_workspace_backup),
+        )
+        .route(
+            "/api/admin/restore",
+            post(routes::admin::restore_workspace_backup),
         )
         .route("/api/admin/audit-logs", get(routes::admin::list_audit_logs))
         .route(
@@ -150,11 +325,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/spaces/{space_id}/grids/bulk",
             delete(routes::grids::bulk_delete_grids),
         )
+        // Notion-Style Trash & Soft-Delete Lifecycle Endpoints
+        .route("/api/trash/grids", get(routes::grids::list_trashed_grids))
+        .route(
+            "/api/trash/grids/{grid_id}/restore",
+            post(routes::grids::restore_trashed_grid),
+        )
+        .route(
+            "/api/trash/grids/{grid_id}/permanent",
+            delete(routes::grids::permanently_delete_trashed_grid),
+        )
+        .route("/api/trash/empty", delete(routes::grids::empty_trash))
         .route(
             "/api/grids/{grid_id}",
             get(routes::grids::get_grid_schema)
                 .patch(routes::grids::update_grid)
                 .delete(routes::grids::delete_grid),
+        )
+        .route(
+            "/api/grids/{grid_id}/duplicate",
+            post(routes::grids::duplicate_grid),
+        )
+        .route(
+            "/api/grids/{grid_id}/move",
+            patch(routes::grids::move_grid),
+        )
+        .route(
+            "/api/grids/{source_grid_id}/rows/copy-to/{target_grid_id}",
+            post(routes::grids::copy_rows_to_grid),
         )
         .route(
             "/api/grids/{grid_id}/reset-layout",
@@ -215,6 +413,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/grids/{grid_id}/rows/{row_id}/upload",
             post(routes::grids::upload_cell_file),
+        )
+        // Row Comments Endpoints (`grid_row_comments`)
+        .route(
+            "/api/grids/{grid_id}/comments/counts",
+            get(routes::grids::list_grid_comment_counts),
+        )
+        .route(
+            "/api/grids/{grid_id}/rows/{row_id}/comments",
+            get(routes::grids::list_row_comments).post(routes::grids::create_row_comment),
+        )
+        .route(
+            "/api/grids/{grid_id}/rows/{row_id}/comments/{comment_id}",
+            delete(routes::grids::delete_row_comment),
         )
         // Module 3: Notion, AppFlowy & PDF Data Import Engine
         .route(
@@ -302,11 +513,11 @@ async fn health_check(State(state): State<AppState>) -> Json<Value> {
         "service": "pyra_ocean_backend",
         "branding": {
             "app_name": "PyraOcean",
-            "logo_dark": "/public/logo-dark.jpg",
-            "logo_light": "/public/logo-light.jpg",
+            "logo_dark": "/public/logo-dark.png",
+            "logo_light": "/public/logo-light.png",
             "powered_by": "Powered by Pyramakerz",
             "powered_by_logo": "/public/pyramakerz.webp"
         },
-        "phase": 12
+        "phase": 14
     }))
 }

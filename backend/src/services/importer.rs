@@ -193,7 +193,7 @@ pub async fn import_grid_handler(
                     .filter_map(|r| r.get(col_idx).map(|s| s.trim()))
                     .filter(|s| !s.is_empty())
                     .collect();
-                infer_column_schema(&samples, &dataset.rows, col_idx, &user_lookup)
+                infer_column_schema(&col_name, &samples, &dataset.rows, col_idx, &user_lookup)
             }
         };
 
@@ -438,7 +438,7 @@ pub async fn preview_import_handler(
                     .filter_map(|r| r.get(col_idx).map(|s| s.trim()))
                     .filter(|s| !s.is_empty())
                     .collect();
-                infer_column_schema(&samples, &dataset.rows, col_idx, &user_lookup).0
+                infer_column_schema(&col_name, &samples, &dataset.rows, col_idx, &user_lookup).0
             }
         };
 
@@ -1238,11 +1238,22 @@ async fn load_user_lookup(db: &sqlx::PgPool) -> Result<HashMap<String, Uuid>, Au
 }
 
 fn infer_column_schema(
+    col_name: &str,
     samples: &[&str],
     all_rows: &[Vec<String>],
     col_idx: usize,
     user_lookup: &HashMap<String, Uuid>,
 ) -> (ColumnPropertyType, ColumnPropertyConfig) {
+    // 0. Check header name for `Password` / `Secret` / `Token` / `Key` (case-insensitive)
+    let header_lower = col_name.trim().to_lowercase();
+    if header_lower.contains("password")
+        || header_lower.contains("secret")
+        || header_lower.contains("token")
+        || header_lower.contains("key")
+    {
+        return (ColumnPropertyType::Password, ColumnPropertyConfig::Password);
+    }
+
     if samples.is_empty() {
         return (
             ColumnPropertyType::Text,
@@ -1603,6 +1614,7 @@ fn coerce_cell_value(
             CellValue::Files(attachments)
         }
         (ColumnPropertyType::LastModified, _) => CellValue::LastModified(now),
+        (ColumnPropertyType::Password, _) => CellValue::Password(raw.trim().to_string()),
         _ => CellValue::Text(raw.trim().to_string()),
     }
 }

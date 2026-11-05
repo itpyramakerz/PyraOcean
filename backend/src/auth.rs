@@ -1,5 +1,8 @@
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{
+        rand_core::{OsRng, RngCore},
+        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
     Argon2,
 };
 use axum::{
@@ -232,6 +235,27 @@ impl AppCache {
             );
         }
     }
+
+    pub fn clear_all(&self) {
+        if let Ok(mut guard) = self.user_status.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.space_access.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.grid_space.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.grid_access.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.grid_schema.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.space_grids.write() {
+            guard.clear();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -259,7 +283,7 @@ impl JwtConfig {
 }
 
 // ============================================================================
-// 2. Argon2id Password Hashing Utilities
+// 2. Argon2id Password Hashing & RFC 6238 TOTP / Recovery Code Utilities
 // ============================================================================
 
 pub fn hash_password(plain_password: &str) -> Result<String, AuthError> {
@@ -277,6 +301,216 @@ pub fn verify_password(plain_password: &str, password_hash: &str) -> Result<bool
     Ok(Argon2::default()
         .verify_password(plain_password.as_bytes(), &parsed_hash)
         .is_ok())
+}
+
+const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// Generates a 160-bit (20-byte) random secret encoded in RFC 4648 Base32 (32 chars).
+pub fn generate_totp_secret() -> String {
+    let mut raw = [0u8; 20];
+    OsRng.fill_bytes(&mut raw);
+    base32_encode(&raw)
+}
+
+/// Generates a one-time human-friendly Recovery Code (`PYRA-XXXX-XXXX-XXXX`).
+pub fn generate_recovery_code() -> String {
+    const RECOVERY_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rand_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut rand_bytes);
+    let mut out = String::from("PYRA");
+    for (idx, b) in rand_bytes.iter().enumerate() {
+        if idx % 4 == 0 {
+            out.push('-');
+        }
+        out.push(RECOVERY_CHARS[(*b as usize) % RECOVERY_CHARS.len()] as char);
+    }
+    out
+}
+
+/// Builds a standard `otpauth://totp/...` URI compatible with Google Authenticator, Authy, and 1Password.
+pub fn build_otpauth_uri(email: &str, secret: &str) -> String {
+    let clean_email = email.trim().replace(' ', "");
+    format!(
+        "otpauth://totp/PyraOcean:{clean_email}?secret={secret}&issuer=PyraOcean&algorithm=SHA1&digits=6&period=30"
+    )
+}
+
+/// Verifies a 6-digit RFC 6238 TOTP code against `secret_base32` with a ±1 step (±30s) window.
+pub fn verify_totp_code(secret_base32: &str, code: &str, now_unix_secs: u64) -> bool {
+    let digits_only: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits_only.len() != 6 {
+        return false;
+    }
+    let Ok(parsed_code) = digits_only.parse::<u32>() else {
+        return false;
+    };
+    let Some(secret_bytes) = base32_decode(secret_base32) else {
+        return false;
+    };
+    if secret_bytes.is_empty() {
+        return false;
+    }
+
+    let current_step = now_unix_secs / 30;
+    for delta in [-1i64, 0, 1] {
+        let step = (current_step as i64 + delta) as u64;
+        if compute_totp_at_step(&secret_bytes, step) == parsed_code {
+            return true;
+        }
+    }
+    false
+}
+
+fn compute_totp_at_step(secret: &[u8], step: u64) -> u32 {
+    let counter_bytes = step.to_be_bytes();
+    let mac = hmac_sha1(secret, &counter_bytes);
+    let offset = (mac[19] & 0x0f) as usize;
+    let binary = (((mac[offset] & 0x7f) as u32) << 24)
+        | ((mac[offset + 1] as u32) << 16)
+        | ((mac[offset + 2] as u32) << 8)
+        | (mac[offset + 3] as u32);
+    binary % 1_000_000
+}
+
+fn base32_encode(data: &[u8]) -> String {
+    let mut result = String::with_capacity((data.len() * 8 + 4) / 5);
+    let mut buffer: u32 = 0;
+    let mut bits_left: u8 = 0;
+    for &byte in data {
+        buffer = (buffer << 8) | (byte as u32);
+        bits_left += 8;
+        while bits_left >= 5 {
+            bits_left -= 5;
+            let index = ((buffer >> bits_left) & 0x1f) as usize;
+            result.push(BASE32_ALPHABET[index] as char);
+        }
+    }
+    if bits_left > 0 {
+        let index = ((buffer << (5 - bits_left)) & 0x1f) as usize;
+        result.push(BASE32_ALPHABET[index] as char);
+    }
+    result
+}
+
+fn base32_decode(encoded: &str) -> Option<Vec<u8>> {
+    let mut buffer: u32 = 0;
+    let mut bits_left: u8 = 0;
+    let mut out = Vec::new();
+    for ch in encoded.chars() {
+        if ch == '=' || ch.is_whitespace() || ch == '-' {
+            continue;
+        }
+        let val: u32 = match ch.to_ascii_uppercase() {
+            'A'..='Z' => (ch.to_ascii_uppercase() as u32) - ('A' as u32),
+            '2'..='7' => (ch as u32) - ('2' as u32) + 26,
+            _ => return None,
+        };
+        buffer = (buffer << 5) | val;
+        bits_left += 5;
+        if bits_left >= 8 {
+            bits_left -= 8;
+            out.push(((buffer >> bits_left) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+    let mut key_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha1_digest(key);
+        key_block[..20].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner_input = Vec::with_capacity(64 + message.len());
+    inner_input.extend_from_slice(&ipad);
+    inner_input.extend_from_slice(message);
+    let inner_hash = sha1_digest(&inner_input);
+
+    let mut outer_input = Vec::with_capacity(64 + 20);
+    outer_input.extend_from_slice(&opad);
+    outer_input.extend_from_slice(&inner_hash);
+    sha1_digest(&outer_input)
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0x00);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
 }
 
 // ============================================================================
@@ -337,6 +571,8 @@ pub enum AuthError {
     AccountInactive,
     #[error("Insufficient permissions: requires {required}")]
     Forbidden { required: &'static str },
+    #[error("{0}")]
+    ForbiddenMessage(String),
     #[error("Resource not found: {0}")]
     NotFound(String),
     #[error("Validation error: {0}")]
@@ -370,7 +606,9 @@ impl IntoResponse for AuthError {
                 (StatusCode::UNAUTHORIZED, "AUTH_INVALID_CREDENTIALS")
             }
             AuthError::AccountInactive => (StatusCode::FORBIDDEN, "AUTH_ACCOUNT_INACTIVE"),
-            AuthError::Forbidden { .. } => (StatusCode::FORBIDDEN, "RBAC_FORBIDDEN"),
+            AuthError::Forbidden { .. } | AuthError::ForbiddenMessage(_) => {
+                (StatusCode::FORBIDDEN, "RBAC_FORBIDDEN")
+            }
             AuthError::NotFound(_) => (StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND"),
             AuthError::BadRequest(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             AuthError::Conflict(_) => (StatusCode::CONFLICT, "RESOURCE_CONFLICT"),

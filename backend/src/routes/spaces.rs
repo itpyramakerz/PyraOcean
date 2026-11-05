@@ -183,6 +183,9 @@ pub async fn list_space_members(
 
 /// `POST /api/spaces/{space_id}/members`
 /// Grants a `User` access to a specific Space with granular permissions (`can_view`, `can_edit`).
+/// Enforces Strict Hierarchy Rules:
+/// - `SuperAdmin` permissions cannot be downgraded or revoked (`StatusCode::FORBIDDEN`).
+/// - `Admin` (System `Admin` or Space `Admin`) can ONLY modify or revoke Space permissions for standard `User` accounts (`target_user.system_role == SystemRole::User` and `target_space_role != SpaceRole::SpaceAdmin`), and cannot grant/modify `SpaceAdmin` or modify another `Admin`.
 pub async fn grant_space_member(
     State(state): State<AppState>,
     RequireSpaceAdmin(actor): RequireSpaceAdmin,
@@ -205,6 +208,46 @@ pub async fn grant_space_member(
     } else {
         SpaceRole::Viewer
     };
+
+    let (target_global_role,): (SystemRole,) = sqlx::query_as(
+        "SELECT system_role FROM users WHERE id = $1",
+    )
+    .bind(payload.user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("User {} not found", payload.user_id)))?;
+
+    let existing_space_role: Option<(SpaceRole,)> = sqlx::query_as(
+        "SELECT space_role FROM space_members WHERE space_id = $1 AND user_id = $2",
+    )
+    .bind(space_id)
+    .bind(payload.user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    // Rule 1: SuperAdmin Protection (Immutable Root)
+    if target_global_role == SystemRole::SuperAdmin && target_role != SpaceRole::SpaceAdmin {
+        return Err(AuthError::ForbiddenMessage(
+            "Super Admin permissions cannot be revoked.".into(),
+        ));
+    }
+
+    // Rule 3: Admin Authority — an Admin can ONLY modify standard User accounts (and not another Admin or SpaceAdmin)
+    if actor.system_role != SystemRole::SuperAdmin {
+        if target_global_role == SystemRole::SuperAdmin {
+            return Err(AuthError::ForbiddenMessage(
+                "Super Admin permissions cannot be revoked.".into(),
+            ));
+        }
+        if target_global_role != SystemRole::User
+            || existing_space_role.map(|(r,)| r == SpaceRole::SpaceAdmin).unwrap_or(false)
+            || target_role == SpaceRole::SpaceAdmin
+        {
+            return Err(AuthError::ForbiddenMessage(
+                "Admins can only manage Space permissions for standard User accounts.".into(),
+            ));
+        }
+    }
 
     let member: SpaceMember = sqlx::query_as(
         r#"
@@ -242,7 +285,10 @@ pub async fn grant_space_member(
 }
 
 /// `DELETE /api/spaces/{space_id}/members/{user_id}`
-/// Revokes a user's access from a Space.
+/// Revokes a user's access from a Space with strict hierarchical permission checks:
+/// - `SuperAdmin` can NEVER be removed or revoked from any Space (`StatusCode::FORBIDDEN`).
+/// - `SuperAdmin` can revoke any `Admin` or `User`.
+/// - `Admin` can ONLY revoke standard `User` accounts (`target_user.system_role == SystemRole::User` and `target_space_role != SpaceRole::SpaceAdmin`).
 pub async fn revoke_space_member(
     State(state): State<AppState>,
     RequireSpaceAdmin(actor): RequireSpaceAdmin,
@@ -250,6 +296,44 @@ pub async fn revoke_space_member(
 ) -> Result<StatusCode, AuthError> {
     let access = resolve_space_access_cached(&state, actor.clone(), space_id).await?;
     access.ensure_manage()?;
+
+    let (target_global_role,): (SystemRole,) = sqlx::query_as(
+        "SELECT system_role FROM users WHERE id = $1",
+    )
+    .bind(target_user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("User {target_user_id} not found")))?;
+
+    // Rule 1: SuperAdmin Protection (Immutable Root)
+    if target_global_role == SystemRole::SuperAdmin {
+        return Err(AuthError::ForbiddenMessage(
+            "Super Admin permissions cannot be revoked.".into(),
+        ));
+    }
+
+    let existing_space_role: Option<(SpaceRole,)> = sqlx::query_as(
+        "SELECT space_role FROM space_members WHERE space_id = $1 AND user_id = $2",
+    )
+    .bind(space_id)
+    .bind(target_user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some((target_space_role,)) = existing_space_role else {
+        return Err(AuthError::NotFound(
+            "User is not a member of this Space".into(),
+        ));
+    };
+
+    // Rule 3: Admin Authority — an Admin cannot revoke another Admin or SpaceAdmin
+    if actor.system_role != SystemRole::SuperAdmin
+        && (target_global_role != SystemRole::User || target_space_role == SpaceRole::SpaceAdmin)
+    {
+        return Err(AuthError::ForbiddenMessage(
+            "Admins can only revoke Space access for standard User accounts.".into(),
+        ));
+    }
 
     let deleted = sqlx::query(
         "DELETE FROM space_members WHERE space_id = $1 AND user_id = $2",

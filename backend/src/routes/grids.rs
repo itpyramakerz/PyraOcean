@@ -11,11 +11,13 @@ use chrono::{NaiveDate, NaiveTime, Utc};
 use pyra_ocean_shared::{
     BulkDeleteGridsRequest, BulkDeleteGridsResponse, BulkDeleteRowsRequest, BulkDeleteRowsResponse,
     BulkPatchCellsRequest, CellValue, ChecklistItem, ColumnPropertyConfig, ColumnPropertyType,
-    CreateColumnRequest, CreateGridRequest, CreateRowRequest, FileAttachment, FilterOperator,
-    GridColumn, GridHistoryDetail, GridHistoryEntry, GridRow, GridSchemaResponse, GridSnapshotData,
-    PageGrid, PatchRowRequest, ReorderColumnsRequest, ReorderRowsRequest,
-    RestoreGridHistoryResponse, RestoreRowsRequest, RowCellMap, SelectOption, SortDirection,
-    TagColor, UpdateColumnRequest, UpdateGridRequest,
+    CopyRowsToGridRequest, CopyRowsToGridResponse, CreateColumnRequest, CreateGridRequest,
+    CreateRowCommentRequest, CreateRowRequest, DuplicateGridRequest, EmptyTrashResponse,
+    FileAttachment, FilterOperator, GridColumn, GridHistoryDetail, GridHistoryEntry, GridRow,
+    GridRowComment, GridSchemaResponse, GridSnapshotData, MoveGridRequest, PageGrid,
+    PatchRowRequest, ReorderColumnsRequest, ReorderRowsRequest, RestoreGridHistoryResponse,
+    RestoreRowsRequest, RowCellMap, SelectOption, SortDirection, SystemRole, TagColor,
+    TrashedGridItem, UpdateColumnRequest, UpdateGridRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -72,9 +74,9 @@ pub async fn list_space_grids(
 
     let grids: Vec<PageGrid> = sqlx::query_as(
         r#"
-        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
         FROM pages_grids
-        WHERE space_id = $1 AND is_archived = FALSE
+        WHERE space_id = $1 AND is_archived = FALSE AND deleted_at IS NULL
         ORDER BY position ASC, created_at ASC
         "#,
     )
@@ -205,6 +207,7 @@ pub fn default_config_for_type(prop_type: ColumnPropertyType) -> ColumnPropertyC
         ColumnPropertyType::Person => ColumnPropertyConfig::Person {
             allow_multiple: true,
         },
+        ColumnPropertyType::Password => ColumnPropertyConfig::Password,
     }
 }
 
@@ -223,9 +226,9 @@ pub async fn get_grid_schema(
 
     let grid: PageGrid = sqlx::query_as(
         r#"
-        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
         FROM pages_grids
-        WHERE id = $1 AND is_archived = FALSE
+        WHERE id = $1 AND is_archived = FALSE AND deleted_at IS NULL
         "#,
     )
     .bind(grid_id)
@@ -263,9 +266,9 @@ pub async fn update_grid(
 
     let existing: PageGrid = sqlx::query_as(
         r#"
-        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
         FROM pages_grids
-        WHERE id = $1 AND is_archived = FALSE
+        WHERE id = $1 AND is_archived = FALSE AND deleted_at IS NULL
         "#,
     )
     .bind(grid_id)
@@ -297,8 +300,8 @@ pub async fn update_grid(
             description = $3,
             icon = $4,
             updated_at = NOW()
-        WHERE id = $1 AND is_archived = FALSE
-        RETURNING id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at
+        WHERE id = $1 AND is_archived = FALSE AND deleted_at IS NULL
+        RETURNING id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
         "#,
     )
     .bind(grid_id)
@@ -324,8 +327,8 @@ pub async fn update_grid(
 }
 
 /// `DELETE /api/grids/{grid_id}`
-/// Hard-deletes a single Grid Page (`ON DELETE CASCADE` cleans up `grid_columns`, `grid_rows`,
-/// and `grid_history_snapshots`), invalidates `AppCache`, and records an async audit log entry.
+/// Moves a single Grid Page to Trash (Soft Delete: `deleted_at = NOW(), deleted_by = $2`),
+/// invalidates `AppCache`, and records an async audit log entry.
 pub async fn delete_grid(
     State(state): State<AppState>,
     RequireSpaceAccess(user): RequireSpaceAccess,
@@ -334,10 +337,19 @@ pub async fn delete_grid(
     let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
     access.ensure_write()?;
 
-    let result = sqlx::query("DELETE FROM pages_grids WHERE id = $1")
-        .bind(grid_id)
-        .execute(&state.db)
-        .await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE pages_grids
+        SET deleted_at = NOW(),
+            deleted_by = $2,
+            updated_at = NOW()
+        WHERE id = $1 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(grid_id)
+    .bind(user.user_id)
+    .execute(&state.db)
+    .await?;
 
     if result.rows_affected() == 0 {
         return Err(AuthError::NotFound(format!("Grid {grid_id} not found")));
@@ -351,8 +363,8 @@ pub async fn delete_grid(
         user.user_id,
         Some(access.space_id),
         Some(grid_id),
-        "grid.delete",
-        json!({ "deleted_grid_id": grid_id }),
+        "grid.trash",
+        json!({ "trashed_grid_id": grid_id }),
     )
     .await?;
 
@@ -360,8 +372,8 @@ pub async fn delete_grid(
 }
 
 /// `DELETE /api/spaces/{space_id}/grids/bulk`
-/// Atomically deletes multiple Grids within a Space (`DELETE FROM pages_grids WHERE space_id = $1 AND id = ANY($2)`),
-/// invalidates the in-memory cache for all deleted `grid_ids`, and returns `BulkDeleteGridsResponse`.
+/// Moves multiple Grids within a Space to Trash (`UPDATE pages_grids SET deleted_at = NOW(), deleted_by = $3`),
+/// invalidates the in-memory cache for all soft-deleted `grid_ids`, and returns `BulkDeleteGridsResponse`.
 pub async fn bulk_delete_grids(
     State(state): State<AppState>,
     RequireSpaceAccess(user): RequireSpaceAccess,
@@ -375,11 +387,20 @@ pub async fn bulk_delete_grids(
         return Ok(Json(BulkDeleteGridsResponse { deleted_count: 0 }));
     }
 
-    let result = sqlx::query("DELETE FROM pages_grids WHERE space_id = $1 AND id = ANY($2)")
-        .bind(space_id)
-        .bind(&payload.grid_ids)
-        .execute(&state.db)
-        .await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE pages_grids
+        SET deleted_at = NOW(),
+            deleted_by = $3,
+            updated_at = NOW()
+        WHERE space_id = $1 AND id = ANY($2) AND deleted_at IS NULL
+        "#,
+    )
+    .bind(space_id)
+    .bind(&payload.grid_ids)
+    .bind(user.user_id)
+    .execute(&state.db)
+    .await?;
 
     let deleted_count = result.rows_affected();
 
@@ -393,12 +414,208 @@ pub async fn bulk_delete_grids(
         user.user_id,
         Some(space_id),
         None,
-        "grid.bulk_delete",
+        "grid.bulk_trash",
         json!({ "deleted_count": deleted_count, "grid_ids": payload.grid_ids }),
     )
     .await?;
 
     Ok(Json(BulkDeleteGridsResponse { deleted_count }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmptyTrashQuery {
+    pub space_id: Option<Uuid>,
+}
+
+/// `GET /api/trash/grids`
+/// Lists all soft-deleted grids (`deleted_at IS NOT NULL`) across Spaces where the user has
+/// `Editor` (`CanEdit`), `SpaceAdmin`, or `SuperAdmin` permissions, ordered by `deleted_at DESC`.
+/// Also spawns a non-blocking background task to permanently purge grids older than 30 days.
+pub async fn list_trashed_grids(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+) -> Result<Json<Vec<TrashedGridItem>>, AuthError> {
+    let db_for_cleanup = state.db.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "DELETE FROM pages_grids WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL '30 days'",
+        )
+        .execute(&db_for_cleanup)
+        .await;
+    });
+
+    let is_super_admin = user.system_role == SystemRole::SuperAdmin;
+
+    let items: Vec<TrashedGridItem> = sqlx::query_as(
+        r#"
+        SELECT
+            pg.id,
+            pg.space_id,
+            s.name AS space_name,
+            pg.title AS name,
+            pg.icon,
+            pg.deleted_at,
+            u.email AS deleted_by_email,
+            GREATEST(
+                0::bigint,
+                30 - (EXTRACT(EPOCH FROM (NOW() - pg.deleted_at)) / 86400)::bigint
+            ) AS days_remaining
+        FROM pages_grids pg
+        INNER JOIN spaces s ON s.id = pg.space_id
+        LEFT JOIN users u ON u.id = pg.deleted_by
+        WHERE pg.deleted_at IS NOT NULL
+          AND pg.is_archived = FALSE
+          AND s.is_archived = FALSE
+          AND (
+              $1 = TRUE
+              OR EXISTS (
+                  SELECT 1 FROM space_members sm
+                  WHERE sm.space_id = s.id
+                    AND sm.user_id = $2
+                    AND sm.space_role IN ('editor', 'space_admin')
+              )
+          )
+        ORDER BY pg.deleted_at DESC
+        "#,
+    )
+    .bind(is_super_admin)
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(items))
+}
+
+/// `POST /api/trash/grids/{grid_id}/restore`
+/// Restores a soft-deleted Grid (`deleted_at = NULL, deleted_by = NULL`) back to its parent Space.
+pub async fn restore_trashed_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+) -> Result<Json<PageGrid>, AuthError> {
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let restored: PageGrid = sqlx::query_as(
+        r#"
+        UPDATE pages_grids
+        SET deleted_at = NULL,
+            deleted_by = NULL,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("Trashed grid {grid_id} not found")))?;
+
+    state.cache.invalidate_grid(&grid_id);
+    state.cache.invalidate_space(&restored.space_id);
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(restored.space_id),
+        Some(grid_id),
+        "grid.restore",
+        json!({ "restored_grid_id": grid_id, "title": restored.title }),
+    )
+    .await?;
+
+    Ok(Json(restored))
+}
+
+/// `DELETE /api/trash/grids/{grid_id}/permanent`
+/// Permanently deletes a soft-deleted Grid (`DELETE FROM pages_grids WHERE id = $1 AND deleted_at IS NOT NULL`),
+/// cascading to `grid_columns`, `grid_rows`, and `grid_history_snapshots`.
+pub async fn permanently_delete_trashed_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+) -> Result<StatusCode, AuthError> {
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+    access.ensure_write()?;
+
+    let result = sqlx::query("DELETE FROM pages_grids WHERE id = $1 AND deleted_at IS NOT NULL")
+        .bind(grid_id)
+        .execute(&state.db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AuthError::NotFound(format!(
+            "Trashed grid {grid_id} not found"
+        )));
+    }
+
+    state.cache.invalidate_grid(&grid_id);
+    state.cache.invalidate_space(&access.space_id);
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "grid.permanent_delete",
+        json!({ "purged_grid_id": grid_id }),
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/trash/empty?space_id=...`
+/// Permanently purges all soft-deleted Grids accessible to the user's edit/admin scope (optionally filtered by `space_id`).
+pub async fn empty_trash(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Query(query): Query<EmptyTrashQuery>,
+) -> Result<Json<EmptyTrashResponse>, AuthError> {
+    let is_super_admin = user.system_role == SystemRole::SuperAdmin;
+
+    let purged_rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        r#"
+        DELETE FROM pages_grids pg
+        USING spaces s
+        WHERE pg.space_id = s.id
+          AND pg.deleted_at IS NOT NULL
+          AND ($1::uuid IS NULL OR pg.space_id = $1)
+          AND (
+              $2 = TRUE
+              OR EXISTS (
+                  SELECT 1 FROM space_members sm
+                  WHERE sm.space_id = pg.space_id
+                    AND sm.user_id = $3
+                    AND sm.space_role IN ('editor', 'space_admin')
+              )
+          )
+        RETURNING pg.id, pg.space_id
+        "#,
+    )
+    .bind(query.space_id)
+    .bind(is_super_admin)
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let purged_count = purged_rows.len() as u64;
+    for (gid, sid) in &purged_rows {
+        state.cache.invalidate_grid(gid);
+        state.cache.invalidate_space(sid);
+    }
+
+    record_audit_log(
+        &state.db,
+        user.user_id,
+        query.space_id,
+        None,
+        "grid.trash.empty",
+        json!({ "purged_count": purged_count, "space_id": query.space_id }),
+    )
+    .await?;
+
+    Ok(Json(EmptyTrashResponse { purged_count }))
 }
 
 /// `POST /api/grids/{grid_id}/columns`
@@ -562,6 +779,7 @@ pub async fn update_column(
 
     let target_type = payload.property_type.unwrap_or(existing.property_type);
     let type_changed = target_type != existing.property_type;
+    let has_explicit_config = payload.property_config.is_some();
 
     let mut new_config = match payload.property_config {
         Some(cfg) => cfg,
@@ -601,8 +819,13 @@ pub async fn update_column(
             }
         }
 
-        // Auto-build `SelectOption` tags if converting into `Select` or `MultiSelect`
-        if matches!(target_type, ColumnPropertyType::Select | ColumnPropertyType::MultiSelect) {
+        // Auto-build `SelectOption` tags if converting into `Select` or `MultiSelect` without an explicit config
+        if !has_explicit_config
+            && matches!(
+                target_type,
+                ColumnPropertyType::Select | ColumnPropertyType::MultiSelect
+            )
+        {
             let mut labels: BTreeMap<String, SelectOption> = BTreeMap::new();
             for text in extracted_strings.values() {
                 if target_type == ColumnPropertyType::MultiSelect {
@@ -885,6 +1108,7 @@ fn cell_to_convertible_string(val: &CellValue, old_cfg: &ColumnPropertyConfig) -
             .map(|u| u.to_string())
             .collect::<Vec<_>>()
             .join(", "),
+        CellValue::Password(s) => s.clone(),
     }
 }
 
@@ -898,6 +1122,7 @@ fn convert_string_to_cell(
     let trimmed = raw.trim();
     match target_type {
         ColumnPropertyType::Text => CellValue::Text(trimmed.to_string()),
+        ColumnPropertyType::Password => CellValue::Password(trimmed.to_string()),
         ColumnPropertyType::Number => {
             let cleaned: String = trimmed
                 .chars()
@@ -2152,4 +2377,697 @@ fn sanitize_filename(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+// ============================================================================
+// 8. Row Comments Endpoints (`grid_row_comments`)
+// ============================================================================
+
+/// `GET /api/grids/{grid_id}/comments/counts`
+/// Returns a map of `row_id -> comment_count` for all rows in the grid that have comments.
+pub async fn list_grid_comment_counts(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+) -> Result<Json<HashMap<Uuid, i64>>, AuthError> {
+    let _access = resolve_grid_access_cached(&state, user, grid_id).await?;
+
+    let pairs: Vec<(Uuid, i64)> = sqlx::query_as(
+        r#"
+        SELECT row_id, COUNT(*)::bigint AS comment_count
+        FROM grid_row_comments
+        WHERE grid_id = $1
+        GROUP BY row_id
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut map = HashMap::with_capacity(pairs.len());
+    for (rid, count) in pairs {
+        map.insert(rid, count);
+    }
+
+    Ok(Json(map))
+}
+
+/// `GET /api/grids/{grid_id}/rows/{row_id}/comments`
+/// Lists all comments on `row_id` ordered chronologically (`created_at ASC`).
+pub async fn list_row_comments(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((grid_id, row_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<GridRowComment>>, AuthError> {
+    let _access = resolve_grid_access_cached(&state, user, grid_id).await?;
+
+    let comments: Vec<GridRowComment> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, row_id, author_id, author_email, content, created_at
+        FROM grid_row_comments
+        WHERE grid_id = $1 AND row_id = $2
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .bind(row_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(comments))
+}
+
+/// `POST /api/grids/{grid_id}/rows/{row_id}/comments`
+/// Appends a new comment to `row_id`.
+pub async fn create_row_comment(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((grid_id, row_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<CreateRowCommentRequest>,
+) -> Result<(StatusCode, Json<GridRowComment>), AuthError> {
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+    let trimmed = payload.content.trim();
+    if trimmed.is_empty() {
+        return Err(AuthError::BadRequest(
+            "Comment content cannot be empty".into(),
+        ));
+    }
+
+    let comment: GridRowComment = sqlx::query_as(
+        r#"
+        INSERT INTO grid_row_comments (grid_id, row_id, author_id, author_email, content)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, grid_id, row_id, author_id, author_email, content, created_at
+        "#,
+    )
+    .bind(grid_id)
+    .bind(row_id)
+    .bind(user.user_id)
+    .bind(&user.email)
+    .bind(trimmed)
+    .fetch_one(&state.db)
+    .await?;
+
+    let _ = record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(access.space_id),
+        Some(grid_id),
+        "row.comment.create",
+        json!({
+            "row_id": row_id,
+            "comment_id": comment.id
+        }),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(comment)))
+}
+
+/// `DELETE /api/grids/{grid_id}/rows/{row_id}/comments/{comment_id}`
+/// Deletes a comment on `row_id` (allowed if caller is the comment author or has write access to the space).
+pub async fn delete_row_comment(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((grid_id, row_id, comment_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<StatusCode, AuthError> {
+    let access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+
+    let existing: Option<(Option<Uuid>, Option<SystemRole>)> = sqlx::query_as(
+        r#"
+        SELECT c.author_id, u.system_role
+        FROM grid_row_comments c
+        LEFT JOIN users u ON u.id = c.author_id
+        WHERE c.id = $1 AND c.grid_id = $2 AND c.row_id = $3
+        "#,
+    )
+    .bind(comment_id)
+    .bind(grid_id)
+    .bind(row_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some((author_id, author_role)) = existing else {
+        return Err(AuthError::NotFound(format!("Comment {comment_id} not found")));
+    };
+
+    if author_id != Some(user.user_id) {
+        if author_role == Some(SystemRole::SuperAdmin) && user.system_role != SystemRole::SuperAdmin
+        {
+            return Err(AuthError::ForbiddenMessage(
+                "Super Admin permissions cannot be revoked.".into(),
+            ));
+        }
+        if user.system_role == SystemRole::User && !access.effective_space_role.can_manage_space() {
+            return Err(AuthError::Forbidden {
+                required: "Comment Author or Space Admin",
+            });
+        }
+        if user.system_role != SystemRole::SuperAdmin
+            && author_role == Some(SystemRole::Admin)
+        {
+            return Err(AuthError::ForbiddenMessage(
+                "Admins cannot delete or revoke another Admin's records.".into(),
+            ));
+        }
+    }
+
+    sqlx::query("DELETE FROM grid_row_comments WHERE id = $1 AND grid_id = $2 AND row_id = $3")
+        .bind(comment_id)
+        .bind(grid_id)
+        .bind(row_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
+// 8. Phase 17: Duplicate Grid, Move Grid to Another Space, and Cross-Grid Row Copy
+// ============================================================================
+
+/// `POST /api/grids/{grid_id}/duplicate`
+/// Clones a Grid Page (schema + optional rows) into the same Space or a chosen destination Space.
+pub async fn duplicate_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(payload): Json<DuplicateGridRequest>,
+) -> Result<(StatusCode, Json<PageGrid>), AuthError> {
+    // 1. Verify caller has at least CanView on the source grid
+    let source_access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+
+    let source_grid: PageGrid = sqlx::query_as(
+        r#"
+        SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
+        FROM pages_grids
+        WHERE id = $1 AND is_archived = FALSE AND deleted_at IS NULL
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("Grid {grid_id} not found")))?;
+
+    let dest_space_id = payload.target_space_id.unwrap_or(source_grid.space_id);
+
+    // 2. Verify caller has CanEdit / SpaceAdmin / SuperAdmin on the destination Space
+    let dest_access = resolve_space_access_cached(&state, user.clone(), dest_space_id).await?;
+    dest_access.ensure_write()?;
+
+    let new_title = payload
+        .new_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{} (Copy)", source_grid.title));
+
+    let source_columns: Vec<GridColumn> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+        FROM grid_columns
+        WHERE grid_id = $1
+        ORDER BY position ASC, created_at ASC
+        "#,
+    )
+    .bind(grid_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let source_rows: Vec<GridRow> = if payload.include_rows {
+        sqlx::query_as(
+            r#"
+            SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+            FROM grid_rows
+            WHERE grid_id = $1
+            ORDER BY position ASC, row_order ASC, created_at ASC, id ASC
+            "#,
+        )
+        .bind(grid_id)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    let mut tx = state.db.begin().await?;
+
+    let next_grid_pos: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM pages_grids WHERE space_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(dest_space_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let new_grid: PageGrid = sqlx::query_as(
+        r#"
+        INSERT INTO pages_grids (space_id, title, description, icon, position, created_by, is_archived)
+        VALUES ($1, $2, $3, $4, $5, $6, FALSE)
+        RETURNING id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
+        "#,
+    )
+    .bind(dest_space_id)
+    .bind(&new_title)
+    .bind(&source_grid.description)
+    .bind(&source_grid.icon)
+    .bind(next_grid_pos)
+    .bind(user.user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Map old_col_id -> new_col_id while inserting cloned columns
+    let mut col_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(source_columns.len());
+    for col in &source_columns {
+        let new_col_id = Uuid::new_v4();
+        col_id_map.insert(col.id, new_col_id);
+
+        sqlx::query(
+            r#"
+            INSERT INTO grid_columns (id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+        )
+        .bind(new_col_id)
+        .bind(new_grid.id)
+        .bind(&col.name)
+        .bind(col.property_type)
+        .bind(sqlx::types::Json(&col.property_config))
+        .bind(col.width_px)
+        .bind(col.position)
+        .bind(col.is_primary)
+        .bind(col.is_hidden)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if payload.include_rows {
+        for (idx, row) in source_rows.iter().enumerate() {
+            let mut remapped_cells: RowCellMap = HashMap::new();
+            for (old_cid, val) in &row.cells {
+                if let Some(&new_cid) = col_id_map.get(old_cid) {
+                    remapped_cells.insert(new_cid, val.clone());
+                }
+            }
+            let pos = idx as i32;
+            let ord = (pos as f64 + 1.0) * 1000.0;
+
+            sqlx::query(
+                r#"
+                INSERT INTO grid_rows (grid_id, position, row_order, cells, created_by, updated_by)
+                VALUES ($1, $2, $3, $4, $5, $5)
+                "#,
+            )
+            .bind(new_grid.id)
+            .bind(pos)
+            .bind(ord)
+            .bind(sqlx::types::Json(&remapped_cells))
+            .bind(user.user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+
+    state.cache.invalidate_space(&source_access.space_id);
+    state.cache.invalidate_space(&dest_space_id);
+    state.cache.invalidate_grid(&new_grid.id);
+
+    let _ = record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(dest_space_id),
+        Some(new_grid.id),
+        "grid.duplicate",
+        json!({
+            "source_grid_id": grid_id,
+            "new_grid_id": new_grid.id,
+            "title": new_grid.title,
+            "include_rows": payload.include_rows
+        }),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(new_grid)))
+}
+
+/// `PATCH /api/grids/{grid_id}/move`
+/// Moves a Grid Page from its current Space to `payload.target_space_id`.
+pub async fn move_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path(grid_id): Path<Uuid>,
+    Json(payload): Json<MoveGridRequest>,
+) -> Result<Json<PageGrid>, AuthError> {
+    // 1. Verify write access on source Grid/Space
+    let source_access = resolve_grid_access_cached(&state, user.clone(), grid_id).await?;
+    source_access.ensure_write()?;
+
+    // 2. Verify write access on target Space
+    let target_access =
+        resolve_space_access_cached(&state, user.clone(), payload.target_space_id).await?;
+    target_access.ensure_write()?;
+
+    let updated: PageGrid = sqlx::query_as(
+        r#"
+        UPDATE pages_grids
+        SET space_id = $1,
+            updated_at = NOW()
+        WHERE id = $2 AND is_archived = FALSE AND deleted_at IS NULL
+        RETURNING id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by
+        "#,
+    )
+    .bind(payload.target_space_id)
+    .bind(grid_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AuthError::NotFound(format!("Grid {grid_id} not found")))?;
+
+    state.cache.invalidate_grid(&grid_id);
+    state.cache.invalidate_space(&source_access.space_id);
+    state.cache.invalidate_space(&payload.target_space_id);
+
+    let _ = record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(payload.target_space_id),
+        Some(grid_id),
+        "grid.move",
+        json!({
+            "from_space_id": source_access.space_id,
+            "to_space_id": payload.target_space_id,
+            "title": updated.title
+        }),
+    )
+    .await;
+
+    Ok(Json(updated))
+}
+
+/// `POST /api/grids/{source_grid_id}/rows/copy-to/{target_grid_id}`
+/// Copies specific rows from `source_grid_id` into `target_grid_id` with smart case-insensitive
+/// column name matching, automatic `Select`/`MultiSelect` tag option merging, and optional
+/// auto-creation of missing columns in the target grid.
+pub async fn copy_rows_to_grid(
+    State(state): State<AppState>,
+    RequireSpaceAccess(user): RequireSpaceAccess,
+    Path((source_grid_id, target_grid_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<CopyRowsToGridRequest>,
+) -> Result<Json<CopyRowsToGridResponse>, AuthError> {
+    if payload.row_ids.is_empty() {
+        return Ok(Json(CopyRowsToGridResponse {
+            copied_count: 0,
+            created_columns_count: 0,
+        }));
+    }
+
+    // 1. Verify CanView on source grid and CanEdit on target grid
+    let _source_access = resolve_grid_access_cached(&state, user.clone(), source_grid_id).await?;
+    let target_access = resolve_grid_access_cached(&state, user.clone(), target_grid_id).await?;
+    target_access.ensure_write()?;
+
+    let source_columns: Vec<GridColumn> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+        FROM grid_columns
+        WHERE grid_id = $1
+        ORDER BY position ASC, created_at ASC
+        "#,
+    )
+    .bind(source_grid_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut target_columns: Vec<GridColumn> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+        FROM grid_columns
+        WHERE grid_id = $1
+        ORDER BY position ASC, created_at ASC
+        "#,
+    )
+    .bind(target_grid_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let source_rows: Vec<GridRow> = sqlx::query_as(
+        r#"
+        SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
+        FROM grid_rows
+        WHERE grid_id = $1 AND id = ANY($2)
+        ORDER BY position ASC, row_order ASC, created_at ASC, id ASC
+        "#,
+    )
+    .bind(source_grid_id)
+    .bind(&payload.row_ids)
+    .fetch_all(&state.db)
+    .await?;
+
+    if source_rows.is_empty() {
+        return Ok(Json(CopyRowsToGridResponse {
+            copied_count: 0,
+            created_columns_count: 0,
+        }));
+    }
+
+    let mut tx = state.db.begin().await?;
+    let mut created_columns_count = 0usize;
+    let mut next_col_pos = target_columns
+        .iter()
+        .map(|c| c.position)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+
+    // Map `source_col.id -> target_col_idx` in `target_columns`
+    let mut source_to_target_idx: HashMap<Uuid, usize> = HashMap::new();
+    let mut modified_target_col_indices: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+
+    for src_col in &source_columns {
+        let src_name_norm = src_col.name.trim().to_lowercase();
+        if let Some(t_idx) = target_columns
+            .iter()
+            .position(|tc| tc.name.trim().to_lowercase() == src_name_norm)
+        {
+            source_to_target_idx.insert(src_col.id, t_idx);
+
+            // Merge Select / MultiSelect options from source_col into target_col if needed
+            let src_options: Vec<SelectOption> = match &src_col.property_config {
+                ColumnPropertyConfig::Select { options }
+                | ColumnPropertyConfig::MultiSelect { options } => options.clone(),
+                _ => Vec::new(),
+            };
+
+            if !src_options.is_empty() {
+                let target_col = &mut target_columns[t_idx];
+                match &mut target_col.property_config {
+                    ColumnPropertyConfig::Select { options }
+                    | ColumnPropertyConfig::MultiSelect { options } => {
+                        let mut changed = false;
+                        for s_opt in src_options {
+                            let exists = options
+                                .iter()
+                                .any(|o| o.label.trim().eq_ignore_ascii_case(s_opt.label.trim()));
+                            if !exists {
+                                let new_opt_id = if options.iter().any(|o| o.id == s_opt.id) {
+                                    Uuid::new_v4()
+                                } else {
+                                    s_opt.id
+                                };
+                                options.push(SelectOption {
+                                    id: new_opt_id,
+                                    label: s_opt.label,
+                                    color: s_opt.color,
+                                });
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            modified_target_col_indices.insert(t_idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if payload.auto_create_missing_columns {
+            // Auto-create the missing column in target_grid_id
+            let created_col: GridColumn = sqlx::query_as(
+                r#"
+                INSERT INTO grid_columns (grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden)
+                VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE)
+                RETURNING id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at
+                "#,
+            )
+            .bind(target_grid_id)
+            .bind(&src_col.name)
+            .bind(src_col.property_type)
+            .bind(sqlx::types::Json(&src_col.property_config))
+            .bind(src_col.width_px)
+            .bind(next_col_pos)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            next_col_pos += 1;
+            created_columns_count += 1;
+            let new_idx = target_columns.len();
+            target_columns.push(created_col);
+            source_to_target_idx.insert(src_col.id, new_idx);
+        }
+    }
+
+    // Persist any merged Select/MultiSelect option configs on existing target columns
+    for t_idx in modified_target_col_indices {
+        let t_col = &target_columns[t_idx];
+        sqlx::query(
+            "UPDATE grid_columns SET property_config = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(sqlx::types::Json(&t_col.property_config))
+        .bind(t_col.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let (mut next_row_pos, mut next_row_ord): (i32, f64) = sqlx::query_as(
+        "SELECT COALESCE(MAX(position) + 1, 0), COALESCE(MAX(row_order) + 1000.0, 1000.0) FROM grid_rows WHERE grid_id = $1",
+    )
+    .bind(target_grid_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let now = Utc::now();
+    let src_col_map: HashMap<Uuid, &GridColumn> =
+        source_columns.iter().map(|c| (c.id, c)).collect();
+
+    for src_row in &source_rows {
+        let mut target_cells: RowCellMap = HashMap::new();
+
+        for (src_cid, src_val) in &src_row.cells {
+            let Some(&t_idx) = source_to_target_idx.get(src_cid) else {
+                continue;
+            };
+            let Some(src_col) = src_col_map.get(src_cid) else {
+                continue;
+            };
+            let target_col = &target_columns[t_idx];
+
+            let mapped_val = if src_col.property_type == target_col.property_type {
+                match (&src_col.property_config, &target_col.property_config, src_val) {
+                    (
+                        ColumnPropertyConfig::Select {
+                            options: src_opts,
+                        },
+                        ColumnPropertyConfig::Select {
+                            options: dst_opts,
+                        },
+                        CellValue::Select(Some(src_oid)),
+                    ) => {
+                        let mapped_oid = src_opts
+                            .iter()
+                            .find(|o| &o.id == src_oid)
+                            .and_then(|s_opt| {
+                                dst_opts.iter().find(|d_opt| {
+                                    d_opt.label.trim().eq_ignore_ascii_case(s_opt.label.trim())
+                                })
+                            })
+                            .map(|d_opt| d_opt.id);
+                        CellValue::Select(mapped_oid)
+                    }
+                    (
+                        ColumnPropertyConfig::MultiSelect {
+                            options: src_opts,
+                        },
+                        ColumnPropertyConfig::MultiSelect {
+                            options: dst_opts,
+                        },
+                        CellValue::MultiSelect(src_oids),
+                    ) => {
+                        let mapped_oids: Vec<Uuid> = src_oids
+                            .iter()
+                            .filter_map(|soid| {
+                                src_opts
+                                    .iter()
+                                    .find(|o| &o.id == soid)
+                                    .and_then(|s_opt| {
+                                        dst_opts.iter().find(|d_opt| {
+                                            d_opt
+                                                .label
+                                                .trim()
+                                                .eq_ignore_ascii_case(s_opt.label.trim())
+                                        })
+                                    })
+                                    .map(|d_opt| d_opt.id)
+                            })
+                            .collect();
+                        CellValue::MultiSelect(mapped_oids)
+                    }
+                    _ => src_val.clone(),
+                }
+            } else {
+                let raw_str = cell_to_convertible_string(src_val, &src_col.property_config);
+                convert_string_to_cell(
+                    &raw_str,
+                    target_col.property_type,
+                    &target_col.property_config,
+                    user.user_id,
+                    now,
+                )
+            };
+
+            target_cells.insert(target_col.id, mapped_val);
+        }
+
+        for t_col in &target_columns {
+            if t_col.property_type == ColumnPropertyType::LastModified {
+                target_cells.insert(t_col.id, CellValue::LastModified(now));
+            }
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO grid_rows (grid_id, position, row_order, cells, created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $5)
+            "#,
+        )
+        .bind(target_grid_id)
+        .bind(next_row_pos)
+        .bind(next_row_ord)
+        .bind(sqlx::types::Json(&target_cells))
+        .bind(user.user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        next_row_pos += 1;
+        next_row_ord += 1000.0;
+    }
+
+    sqlx::query("UPDATE pages_grids SET updated_at = NOW() WHERE id = $1")
+        .bind(target_grid_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    state.cache.invalidate_grid(&target_grid_id);
+
+    let _ = record_audit_log(
+        &state.db,
+        user.user_id,
+        Some(target_access.space_id),
+        Some(target_grid_id),
+        "grid.rows.copy_to",
+        json!({
+            "source_grid_id": source_grid_id,
+            "target_grid_id": target_grid_id,
+            "copied_count": source_rows.len(),
+            "created_columns_count": created_columns_count
+        }),
+    )
+    .await;
+
+    Ok(Json(CopyRowsToGridResponse {
+        copied_count: source_rows.len(),
+        created_columns_count,
+    }))
 }

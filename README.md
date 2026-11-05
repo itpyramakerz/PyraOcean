@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="frontend/public/logo-dark.jpg" alt="PyraOcean Logo" width="120" height="120" style="border-radius: 18px;" />
+<img src="frontend/public/logo-dark.png" alt="PyraOcean Logo" width="120" height="120" style="border-radius: 18px;" />
 
 # 🌊 PyraOcean
 
