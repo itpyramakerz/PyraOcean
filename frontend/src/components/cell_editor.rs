@@ -6,7 +6,7 @@ use pyra_ocean_shared::{
     GridRow, NumberFormat, RowCellMap, SelectOption, SpaceMemberDetail, TagColor,
     UpdateColumnRequest,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 use wasm_bindgen::{prelude::Closure, JsCast};
 
@@ -134,7 +134,21 @@ pub fn cell_to_plain_text(
             .collect::<Vec<_>>()
             .join(", "),
         (_, Some(CellValue::LastModified(dt))) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        (_, Some(CellValue::Password(s))) => s.clone(),
     }
+}
+
+/// Generates a strong 16-character password (`A-Z`, `a-z`, `0-9`, `!@#$%^&*`).
+fn generate_strong_password(len: usize) -> String {
+    const CHARSET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        let idx = (js_sys::Math::random() * (CHARSET.len() as f64)).floor() as usize;
+        let ch = CHARSET[idx.min(CHARSET.len() - 1)] as char;
+        out.push(ch);
+    }
+    out
 }
 
 /// Universal Rust WASM clipboard helper (`copy_to_clipboard(text: &str) -> bool`).
@@ -243,6 +257,35 @@ pub fn compute_floating_popover_style(
     }
 }
 
+/// Returns `true` if `att` is an image attachment by checking either `mime_type` (`image/*`)
+/// or the file URL / filename extension (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`, `.ico`, case-insensitive).
+pub fn is_image_attachment(att: &FileAttachment) -> bool {
+    if att
+        .mime_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/")
+    {
+        return true;
+    }
+    let has_img_ext = |s: &str| -> bool {
+        let clean = s
+            .split('?')
+            .next()
+            .unwrap_or(s)
+            .split('#')
+            .next()
+            .unwrap_or(s)
+            .to_ascii_lowercase();
+        [
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico",
+        ]
+        .iter()
+        .any(|ext| clean.ends_with(ext))
+    };
+    has_img_ext(&att.filename) || has_img_ext(&att.storage_url)
+}
+
 /// Copies plain text to the browser clipboard (supporting both HTTPS Secure Contexts and
 /// plain HTTP LAN IPs via `copy_to_clipboard`) and triggers a 1.5s `✓` feedback state.
 fn copy_text_to_clipboard(text: String, copied_signal: RwSignal<bool>) {
@@ -262,7 +305,7 @@ fn copy_text_to_clipboard(text: String, copied_signal: RwSignal<bool>) {
 }
 
 /// Renders and edits a single spreadsheet cell for any of the 11 strict `ColumnPropertyType`s,
-/// wrapped in a `group relative` container with a hover-to-copy action button.
+/// wrapped in a `group/cell relative` container with a hover-to-copy action button.
 #[component]
 pub fn CellEditor(
     grid_id: Uuid,
@@ -270,6 +313,8 @@ pub fn CellEditor(
     column: GridColumn,
     can_edit: bool,
     space_members: RwSignal<Vec<SpaceMemberDetail>>,
+    #[prop(optional)] revealed_passwords: Option<RwSignal<HashSet<(Uuid, Uuid)>>>,
+    #[prop(optional)] on_before_column_edit: Option<Callback<GridColumn>>,
     on_row_updated: Callback<GridRow>,
     on_column_updated: Callback<GridColumn>,
     on_before_cell_edit: Callback<(Uuid, Uuid, Option<CellValue>, CellValue)>,
@@ -285,6 +330,7 @@ pub fn CellEditor(
     let row_updated_by = row.updated_by;
 
     let copied = RwSignal::new(false);
+    let is_cell_hovered = RwSignal::new(false);
     let col_for_copy = StoredValue::new(column.clone());
     let cell_for_copy = RwSignal::new(current_cell.clone());
 
@@ -312,6 +358,9 @@ pub fn CellEditor(
         if !can_edit {
             return;
         }
+        if let Some(cb) = on_before_column_edit {
+            cb.run(col_for_copy.get_value());
+        }
         let cfg = if is_multi {
             ColumnPropertyConfig::MultiSelect { options: next_opts }
         } else {
@@ -327,7 +376,10 @@ pub fn CellEditor(
         };
         spawn_local(async move {
             match ApiClient::update_column(&auth, grid_id, col_id, req).await {
-                Ok(updated_col) => on_column_updated.run(updated_col),
+                Ok(updated_col) => {
+                    col_for_copy.set_value(updated_col.clone());
+                    on_column_updated.run(updated_col);
+                }
                 Err(e) => on_error.run(e),
             }
         });
@@ -598,8 +650,26 @@ pub fn CellEditor(
 
                     <Show when=move || open_dropdown.get() && can_edit>
                         <div
+                            class="fixed inset-0 z-[9998] bg-transparent cursor-default"
+                            on:mousedown=move |ev| {
+                                ev.stop_propagation();
+                                open_dropdown.set(false);
+                            }
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                open_dropdown.set(false);
+                            }
+                        />
+                        <div
                             style=move || popover_style.get()
+                            on:mousedown=move |ev| ev.stop_propagation()
                             on:click=move |ev| ev.stop_propagation()
+                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                if ev.key() == "Escape" {
+                                    ev.stop_propagation();
+                                    open_dropdown.set(false);
+                                }
+                            }
                             class="fixed z-[9999] w-64 max-h-80 overflow-y-auto shadow-2xl border border-slate-700 bg-slate-900 rounded-lg p-2.5 space-y-2"
                         >
                             <div class="flex items-center justify-between px-1 pb-1 border-b border-[#2A2F37] text-[10px] text-slate-400">
@@ -935,8 +1005,26 @@ pub fn CellEditor(
 
                     <Show when=move || open_popover.get() && can_edit>
                         <div
+                            class="fixed inset-0 z-[9998] bg-transparent cursor-default"
+                            on:mousedown=move |ev| {
+                                ev.stop_propagation();
+                                open_popover.set(false);
+                            }
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                open_popover.set(false);
+                            }
+                        />
+                        <div
                             style=move || popover_style.get()
+                            on:mousedown=move |ev| ev.stop_propagation()
                             on:click=move |ev| ev.stop_propagation()
+                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                if ev.key() == "Escape" {
+                                    ev.stop_propagation();
+                                    open_popover.set(false);
+                                }
+                            }
                             class="fixed z-[9999] w-64 max-h-80 overflow-y-auto shadow-2xl border border-slate-700 bg-slate-900 rounded-lg p-2.5 space-y-2"
                         >
                             <div class="flex items-center justify-between px-1 pb-1 border-b border-[#2A2F37] text-[10px] text-slate-400">
@@ -1304,8 +1392,26 @@ pub fn CellEditor(
 
                     <Show when=move || open_checklist.get()>
                         <div
+                            class="fixed inset-0 z-[9998] bg-transparent cursor-default"
+                            on:mousedown=move |ev| {
+                                ev.stop_propagation();
+                                open_checklist.set(false);
+                            }
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                open_checklist.set(false);
+                            }
+                        />
+                        <div
                             style=move || checklist_popover_style.get()
+                            on:mousedown=move |ev| ev.stop_propagation()
                             on:click=move |ev| ev.stop_propagation()
+                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                if ev.key() == "Escape" {
+                                    ev.stop_propagation();
+                                    open_checklist.set(false);
+                                }
+                            }
                             class="fixed z-[9999] w-64 max-h-80 overflow-y-auto shadow-2xl border border-slate-700 bg-slate-900 rounded-lg p-3 space-y-2"
                         >
                             <div class="flex items-center justify-between border-b border-[#2A2F37] pb-1.5">
@@ -1382,7 +1488,7 @@ pub fn CellEditor(
         }
 
         // ====================================================================
-        // 9. `Files`: Clickable file chips + `+ Upload` multipart file button
+        // 9. `Files`: Compact Image Thumbnails & Icon Tiles + Individual Hover `✕` Delete (`group/file`) + `+ Upload`
         // ====================================================================
         ColumnPropertyType::Files => {
             let attachments = RwSignal::new(match &current_cell {
@@ -1391,6 +1497,19 @@ pub fn CellEditor(
             });
             let uploading = RwSignal::new(false);
             let file_input_ref = NodeRef::<leptos::html::Input>::new();
+
+            let remove_attachment = move |att_id: Uuid| {
+                if !can_edit {
+                    return;
+                }
+                let mut next_files = attachments.get_untracked();
+                let before_len = next_files.len();
+                next_files.retain(|f| f.id != att_id);
+                if next_files.len() != before_len {
+                    attachments.set(next_files.clone());
+                    save_cell.run(CellValue::Files(next_files));
+                }
+            };
 
             let on_files_selected = move |ev: web_sys::Event| {
                 let Some(target) = ev.target() else {
@@ -1413,11 +1532,18 @@ pub fn CellEditor(
                     return;
                 }
 
+                let prev_val = cell_for_copy.get_untracked();
                 uploading.set(true);
                 spawn_local(async move {
                     match ApiClient::upload_cell_files(&auth, grid_id, row_id, col_id, selected_files).await {
                         Ok(updated_row) => {
                             if let Some(CellValue::Files(new_files)) = updated_row.cells.get(&col_id) {
+                                on_before_cell_edit.run((
+                                    row_id,
+                                    col_id,
+                                    prev_val,
+                                    CellValue::Files(new_files.clone()),
+                                ));
                                 attachments.set(new_files.clone());
                                 cell_for_copy.set(Some(CellValue::Files(new_files.clone())));
                             }
@@ -1433,22 +1559,87 @@ pub fn CellEditor(
             };
 
             view! {
-                <div class="w-full h-full min-h-[34px] flex items-center flex-wrap gap-1 px-2 pr-8 py-1">
+                <div class="w-full h-full min-h-[38px] flex items-center flex-wrap gap-1.5 px-2 pr-8 py-1">
                     {move || {
                         attachments
                             .get()
                             .into_iter()
                             .map(|att: FileAttachment| {
+                                let att_id = att.id;
+                                let is_img = is_image_attachment(&att);
+                                let file_url = att.storage_url.clone();
+                                let filename = att.filename.clone();
+                                let filename_for_del = att.filename.clone();
+                                let lower_name = filename.to_ascii_lowercase();
+                                let file_icon = if lower_name.ends_with(".pdf")
+                                    || lower_name.ends_with(".doc")
+                                    || lower_name.ends_with(".docx")
+                                    || lower_name.ends_with(".txt")
+                                    || lower_name.ends_with(".md")
+                                    || lower_name.ends_with(".csv")
+                                    || lower_name.ends_with(".xlsx")
+                                {
+                                    "📄"
+                                } else {
+                                    "📎"
+                                };
+
                                 view! {
-                                    <a
-                                        href=att.storage_url
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#06B6D4]/15 hover:bg-[#06B6D4]/25 text-[#06B6D4] border border-[#06B6D4]/30 text-[11px] font-medium max-w-[150px] truncate"
-                                    >
-                                        <span>"📎"</span>
-                                        <span class="truncate">{att.filename}</span>
-                                    </a>
+                                    <div class="relative group/file inline-flex items-center justify-center shrink-0">
+                                        {if is_img {
+                                            let href_url = file_url.clone();
+                                            let img_src = file_url.clone();
+                                            let tip = filename.clone();
+                                            view! {
+                                                <a
+                                                    href=href_url
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                    title=tip
+                                                    on:click=move |ev| ev.stop_propagation()
+                                                    class="inline-flex items-center justify-center shrink-0"
+                                                >
+                                                    <img
+                                                        src=img_src
+                                                        alt=""
+                                                        class="w-8 h-8 rounded-md object-cover border border-slate-700/80 shadow-sm hover:scale-105 transition-transform cursor-pointer"
+                                                    />
+                                                </a>
+                                            }
+                                            .into_any()
+                                        } else {
+                                            let href_url = file_url.clone();
+                                            let tip = filename.clone();
+                                            view! {
+                                                <a
+                                                    href=href_url
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                    title=tip
+                                                    on:click=move |ev| ev.stop_propagation()
+                                                    class="w-8 h-8 rounded-md bg-slate-800/90 hover:bg-slate-700 border border-slate-700/80 shadow-sm hover:scale-105 transition-transform cursor-pointer inline-flex items-center justify-center text-sm text-[#06B6D4] shrink-0"
+                                                >
+                                                    <span>{file_icon}</span>
+                                                </a>
+                                            }
+                                            .into_any()
+                                        }}
+
+                                        <Show when=move || can_edit>
+                                            <button
+                                                type="button"
+                                                title=format!("Remove {filename_for_del}")
+                                                on:click=move |ev| {
+                                                    ev.prevent_default();
+                                                    ev.stop_propagation();
+                                                    remove_attachment(att_id);
+                                                }
+                                                class="absolute -top-1.5 -right-1.5 z-10 w-4 h-4 rounded-full bg-red-600 hover:bg-red-500 text-white text-[9px] leading-none font-bold flex items-center justify-center shadow-md opacity-0 group-hover/file:opacity-100 transition-opacity cursor-pointer"
+                                            >
+                                                "✕"
+                                            </button>
+                                        </Show>
+                                    </div>
                                 }
                             })
                             .collect_view()
@@ -1464,13 +1655,15 @@ pub fn CellEditor(
                         />
                         <button
                             type="button"
+                            title="Upload files or images"
                             disabled=move || uploading.get()
-                            on:click=move |_| {
+                            on:click=move |ev| {
+                                ev.stop_propagation();
                                 if let Some(input) = file_input_ref.get() {
                                     input.click();
                                 }
                             }
-                            class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300 border border-[#2A2F37]"
+                            class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300 border border-[#2A2F37] shrink-0"
                         >
                             {move || if uploading.get() { "..." } else { "+ Upload" }}
                         </button>
@@ -1552,8 +1745,26 @@ pub fn CellEditor(
 
                     <Show when=move || open_person_picker.get() && can_edit>
                         <div
+                            class="fixed inset-0 z-[9998] bg-transparent cursor-default"
+                            on:mousedown=move |ev| {
+                                ev.stop_propagation();
+                                open_person_picker.set(false);
+                            }
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                open_person_picker.set(false);
+                            }
+                        />
+                        <div
                             style=move || person_popover_style.get()
+                            on:mousedown=move |ev| ev.stop_propagation()
                             on:click=move |ev| ev.stop_propagation()
+                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                if ev.key() == "Escape" {
+                                    ev.stop_propagation();
+                                    open_person_picker.set(false);
+                                }
+                            }
                             class="fixed z-[9999] w-56 max-h-80 overflow-y-auto shadow-2xl border border-slate-700 bg-slate-900 rounded-lg p-2.5 space-y-1"
                         >
                             <div class="flex items-center justify-between px-1 pb-1 border-b border-[#2A2F37] text-[10px] text-slate-400">
@@ -1625,45 +1836,228 @@ pub fn CellEditor(
             }
             .into_any()
         }
+
+        // ====================================================================
+        // 12. `Password`: Masked Secret (`••••••••••••`) + Per-Cell Reveal (`👁️`), Copy (`📋`), & Generator (`🎲`)
+        // ====================================================================
+        ColumnPropertyType::Password => {
+            let initial_secret = match &current_cell {
+                Some(CellValue::Password(s)) | Some(CellValue::Text(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let editing = RwSignal::new(false);
+            let draft = RwSignal::new(initial_secret.clone());
+            let committed = RwSignal::new(initial_secret);
+            let local_revealed = RwSignal::new(false);
+            let secret_copied = RwSignal::new(false);
+
+            let is_revealed = move || -> bool {
+                if let Some(global_set) = revealed_passwords {
+                    global_set.get().contains(&(row_id, col_id))
+                } else {
+                    local_revealed.get()
+                }
+            };
+
+            let toggle_reveal = move |ev: web_sys::MouseEvent| {
+                ev.stop_propagation();
+                if let Some(global_set) = revealed_passwords {
+                    global_set.update(|set| {
+                        let key = (row_id, col_id);
+                        if set.contains(&key) {
+                            set.remove(&key);
+                        } else {
+                            set.insert(key);
+                        }
+                    });
+                } else {
+                    local_revealed.update(|v| *v = !*v);
+                }
+            };
+
+            let commit_password = move || {
+                editing.set(false);
+                let next = draft.get();
+                if next != committed.get_untracked() {
+                    committed.set(next.clone());
+                    save_cell.run(CellValue::Password(next));
+                }
+            };
+
+            view! {
+                <div
+                    class="w-full h-full min-h-[34px] flex items-center justify-between gap-1 px-2.5 py-1 cursor-text"
+                    on:click=move |_| {
+                        if can_edit && !editing.get() {
+                            editing.set(true);
+                        }
+                    }
+                    on:dblclick=move |_| {
+                        if can_edit {
+                            editing.set(true);
+                        }
+                    }
+                >
+                    <Show
+                        when=move || editing.get() && can_edit
+                        fallback=move || {
+                            let val = committed.get();
+                            if val.is_empty() {
+                                view! {
+                                    <span class="text-slate-600 text-xs select-none">"—"</span>
+                                }
+                                .into_any()
+                            } else {
+                                let revealed_now = is_revealed();
+                                let val_for_copy = val.clone();
+                                view! {
+                                    <div class="w-full flex items-center justify-between gap-1.5 overflow-hidden">
+                                        {if revealed_now {
+                                            view! {
+                                                <span class="text-xs font-mono text-amber-300 truncate">{val}</span>
+                                            }
+                                            .into_any()
+                                        } else {
+                                            view! {
+                                                <span class="text-xs font-mono tracking-widest text-slate-400 select-none truncate">
+                                                    "••••••••••••"
+                                                </span>
+                                            }
+                                            .into_any()
+                                        }}
+
+                                        <div
+                                            on:click=move |ev| ev.stop_propagation()
+                                            class=move || {
+                                                if is_cell_hovered.get() || secret_copied.get() || revealed_now {
+                                                    "flex items-center gap-1 shrink-0 opacity-100 transition-opacity"
+                                                } else {
+                                                    "flex items-center gap-1 shrink-0 opacity-0 pointer-events-none transition-opacity"
+                                                }
+                                            }
+                                        >
+                                            <button
+                                                type="button"
+                                                title=if revealed_now { "Hide secret" } else { "Reveal secret for this cell only" }
+                                                on:mousedown=move |ev| ev.stop_propagation()
+                                                on:click=toggle_reveal
+                                                class=if revealed_now {
+                                                    "px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[10px]"
+                                                } else {
+                                                    "px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-[#2A2F37] text-slate-300 text-[10px]"
+                                                }
+                                            >
+                                                "👁️"
+                                            </button>
+                                            <button
+                                                type="button"
+                                                title="Copy unmasked secret to clipboard"
+                                                on:mousedown=move |ev| ev.stop_propagation()
+                                                on:click=move |ev| {
+                                                    ev.stop_propagation();
+                                                    copy_text_to_clipboard(val_for_copy.clone(), secret_copied);
+                                                }
+                                                class=move || {
+                                                    if secret_copied.get() {
+                                                        "px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-300 text-[10px] font-bold"
+                                                    } else {
+                                                        "px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-[#2A2F37] text-slate-300 text-[10px]"
+                                                    }
+                                                }
+                                            >
+                                                {move || if secret_copied.get() { "✓" } else { "📋" }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                }
+                                .into_any()
+                            }
+                        }
+                    >
+                        <div class="w-full flex items-center gap-1">
+                            <input
+                                type="text"
+                                autofocus
+                                placeholder="Enter secret or click 🎲..."
+                                class="flex-1 min-w-0 px-1.5 py-0.5 rounded bg-[#14171A] border border-amber-400 text-xs font-mono text-amber-300 focus:outline-none"
+                                prop:value=draft
+                                on:input=move |ev| draft.set(event_target_value(&ev))
+                                on:blur=move |_| commit_password()
+                                on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                    if ev.key() == "Enter" {
+                                        commit_password();
+                                    } else if ev.key() == "Escape" {
+                                        draft.set(committed.get_untracked());
+                                        editing.set(false);
+                                    }
+                                }
+                            />
+                            <button
+                                type="button"
+                                title="Generate 16-character strong password (A-Z, a-z, 0-9, !@#$%^&*)"
+                                on:mousedown=move |ev| {
+                                    ev.prevent_default();
+                                    ev.stop_propagation();
+                                    let generated = generate_strong_password(16);
+                                    draft.set(generated);
+                                }
+                                class="px-1.5 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-[10px] font-semibold shrink-0 whitespace-nowrap"
+                            >
+                                "🎲 Generate"
+                            </button>
+                        </div>
+                    </Show>
+                </div>
+            }
+            .into_any()
+        }
     };
 
     view! {
-        <div class="group relative w-full h-full">
+        <div
+            on:mouseenter=move |_| is_cell_hovered.set(true)
+            on:mouseleave=move |_| is_cell_hovered.set(false)
+            class="relative w-full h-full"
+        >
             {inner_editor}
 
-            // Floating One-Click Copy Button (revealed on cell hover)
-            <button
-                type="button"
-                title="Copy cell value to clipboard"
-                on:mousedown=move |ev| {
-                    ev.stop_propagation();
-                }
-                on:dblclick=move |ev| {
-                    ev.stop_propagation();
-                }
-                on:click=move |ev| {
-                    ev.stop_propagation();
-                    let col_val = col_for_copy.get_value();
-                    let cell_val = cell_for_copy.get();
-                    let members = space_members.get();
-                    let plain = cell_to_plain_text(
-                        cell_val.as_ref(),
-                        &col_val,
-                        &members,
-                        row_last_modified,
-                    );
-                    copy_text_to_clipboard(plain, copied);
-                }
-                class=move || {
-                    if copied.get() {
-                        "absolute right-1 top-1/2 -translate-y-1/2 z-30 px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-300 text-[10px] font-bold opacity-100 transition-opacity"
-                    } else {
-                        "absolute right-1 top-1/2 -translate-y-1/2 z-30 px-1.5 py-0.5 rounded bg-[#1E2227]/95 hover:bg-slate-700 border border-[#2A2F37] text-slate-300 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity shadow"
+            // Floating One-Click Copy Button (revealed strictly on single-cell hover; Password cells use their own inline 👁️ + 📋 buttons)
+            <Show when=move || prop_type != ColumnPropertyType::Password>
+                <button
+                    type="button"
+                    title="Copy cell value to clipboard"
+                    on:mousedown=move |ev| {
+                        ev.stop_propagation();
                     }
-                }
-            >
-                {move || if copied.get() { "✓" } else { "⧉" }}
-            </button>
+                    on:dblclick=move |ev| {
+                        ev.stop_propagation();
+                    }
+                    on:click=move |ev| {
+                        ev.stop_propagation();
+                        let col_val = col_for_copy.get_value();
+                        let cell_val = cell_for_copy.get();
+                        let members = space_members.get();
+                        let plain = cell_to_plain_text(
+                            cell_val.as_ref(),
+                            &col_val,
+                            &members,
+                            row_last_modified,
+                        );
+                        copy_text_to_clipboard(plain, copied);
+                    }
+                    class=move || {
+                        if copied.get() {
+                            "absolute right-1 top-1/2 -translate-y-1/2 z-30 px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-300 text-[10px] font-bold opacity-100 transition-opacity"
+                        } else if is_cell_hovered.get() {
+                            "absolute right-1 top-1/2 -translate-y-1/2 z-30 px-1.5 py-0.5 rounded bg-[#1E2227]/95 hover:bg-slate-700 border border-[#2A2F37] text-slate-300 text-[10px] opacity-100 transition-opacity shadow"
+                        } else {
+                            "absolute right-1 top-1/2 -translate-y-1/2 z-30 px-1.5 py-0.5 rounded bg-[#1E2227]/95 border border-[#2A2F37] text-slate-300 text-[10px] opacity-0 pointer-events-none transition-opacity"
+                        }
+                    }
+                >
+                    {move || if copied.get() { "✓" } else { "⧉" }}
+                </button>
+            </Show>
         </div>
     }
 }

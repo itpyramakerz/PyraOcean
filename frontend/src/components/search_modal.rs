@@ -62,7 +62,7 @@ pub fn SearchModal(
                             <input
                                 type="search"
                                 autofocus
-                                placeholder="Search across rows, cells, and Grid titles..."
+                                placeholder="Search across all 12 property types (Select, MultiSelect tags, Text, Numbers, Files, Checklists)..."
                                 class="flex-1 bg-transparent text-sm text-white focus:outline-none"
                                 prop:value=query
                                 on:input=move |ev| {

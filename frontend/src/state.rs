@@ -18,6 +18,7 @@ pub struct AuthState {
     pub active_space_id: RwSignal<Option<Uuid>>,
     pub active_grid_id: RwSignal<Option<Uuid>>,
     pub highlighted_row_id: RwSignal<Option<Uuid>>,
+    pub trash_count: RwSignal<usize>,
     pub dark_mode: RwSignal<bool>,
     pub sidebar_collapsed: RwSignal<bool>,
 }
@@ -36,6 +37,7 @@ impl AuthState {
             active_space_id: RwSignal::new(None),
             active_grid_id: RwSignal::new(None),
             highlighted_row_id: RwSignal::new(None),
+            trash_count: RwSignal::new(0),
             dark_mode: RwSignal::new(stored_dark),
             sidebar_collapsed: RwSignal::new(false),
         }
@@ -60,6 +62,7 @@ impl AuthState {
         self.active_space_id.set(None);
         self.active_grid_id.set(None);
         self.highlighted_row_id.set(None);
+        self.trash_count.set(0);
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -118,9 +121,9 @@ impl AuthState {
     /// Returns the appropriate PyraOcean brand logo path based on active theme mode.
     pub fn active_logo_url(&self) -> &'static str {
         if self.dark_mode.get() {
-            "/public/logo-dark.jpg"
+            "/public/logo-dark.png"
         } else {
-            "/public/logo-light.jpg"
+            "/public/logo-light.png"
         }
     }
 }

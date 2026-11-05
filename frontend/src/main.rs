@@ -10,6 +10,7 @@ use pages::{
     admin::{AdminDashboard, AdminTab},
     grid_view::GridViewPage,
     login::LoginPage,
+    trash_view::TrashViewPage,
 };
 use pyra_ocean_shared::ColumnPropertyType;
 use state::AuthState;
@@ -82,6 +83,7 @@ pub fn App() -> impl IntoView {
             "/admin/users" => admin_tab.set(AdminTab::Users),
             "/admin/spaces" => admin_tab.set(AdminTab::Spaces),
             "/admin/audit" => admin_tab.set(AdminTab::AuditLogs),
+            "/admin/backup" => admin_tab.set(AdminTab::BackupRestore),
             _ => sync_route_params(&path),
         }
         current_path.set(path);
@@ -140,7 +142,9 @@ pub fn App() -> impl IntoView {
                 >
                     {move || {
                         let path = current_path.get();
-                        if path.starts_with("/admin") {
+                        if path == "/trash" {
+                            view! { <TrashViewPage on_navigate=navigate /> }.into_any()
+                        } else if path.starts_with("/admin") {
                             view! { <AdminDashboard initial_tab=admin_tab /> }.into_any()
                         } else if path.starts_with("/spaces/") && path.contains("/grids/") {
                             view! {
@@ -233,7 +237,7 @@ fn WorkspaceHomeView(
                     />
                     <div>
                         <h1 class="text-xl font-bold text-white">
-                            "Welcome to Pyra"<span class="text-[#06B6D4]">"Ocean"</span>
+                            "Welcome to "<span class="text-[#06B6D4]">"PyraOcean"</span>
                         </h1>
                         <p class="text-xs text-slate-400 mt-0.5">
                             {move || format!("Active Route: {} · Select a Space or Grid from the left sidebar", current_path.get())}

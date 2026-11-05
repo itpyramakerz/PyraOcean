@@ -2,17 +2,25 @@ use crate::state::AuthState;
 use gloo_net::http::{Request, RequestBuilder};
 use leptos::prelude::GetUntracked;
 use pyra_ocean_shared::{
-    AuditLogEntry, BulkDeleteGridsRequest, BulkDeleteGridsResponse, BulkDeleteRowsRequest,
-    BulkDeleteRowsResponse, BulkPatchCellsRequest, BulkRowCellPatch, CreateColumnRequest,
-    CreateGridRequest, CreateRowRequest, CreateSpaceRequest, CreateUserRequest,
-    GrantSpaceMemberRequest, GridColumn, GridHistoryDetail, GridHistoryEntry, GridRow,
-    GridSchemaResponse, ImportGridResponse, ImportMode, LoginRequest, LoginResponse, PageGrid,
-    PatchRowRequest, PreviewImportResponse, ReorderColumnsRequest, ReorderRowsRequest,
-    RestoreGridHistoryResponse, RestoreRowsRequest, RowCellMap, SearchHit, SearchScope, Space,
-    SpaceMember, SpaceMemberDetail, SpaceWithRole, SystemRole, UpdateColumnRequest,
-    UpdateGridRequest, UpdateUserRoleRequest, User, UserProfile,
+    AdminManage2faRequest, AdminManage2faResponse, AdminResetPasswordRequest,
+    AdminResetPasswordResponse, AiAttachment, AiChatMessage, AiCopilotRequest, AiCopilotResponse,
+    AiSettings, AuditLogEntry, BulkDeleteGridsRequest, BulkDeleteGridsResponse, BulkDeleteRowsRequest,
+    BulkDeleteRowsResponse, BulkPatchCellsRequest, BulkRowCellPatch, ChangeOwnPasswordRequest,
+    CopyRowsToGridRequest, CopyRowsToGridResponse, CreateColumnRequest, CreateGridRequest,
+    CreateRowCommentRequest, CreateRowRequest, CreateSpaceRequest, CreateUserRequest,
+    DisableTotpRequest, DuplicateGridRequest, EmptyTrashResponse, ForgotPasswordRequest,
+    ForgotPasswordResponse, GoogleAuthSettings, GoogleLoginRequest, GrantSpaceMemberRequest,
+    GridColumn, GridHistoryDetail, GridHistoryEntry, GridRow, GridRowComment, GridSchemaResponse,
+    ImportGridResponse, ImportMode, LoginRequest, LoginResponse, MoveGridRequest, PageGrid,
+    PatchRowRequest, PreviewImportResponse, PublicAuthConfig, ReorderColumnsRequest,
+    ReorderRowsRequest, RestoreBackupResponse, RestoreGridHistoryResponse, RestoreRowsRequest,
+    RowCellMap, SearchHit, SearchScope, SelfServicePasswordResetRequest, Space, SpaceMember,
+    SpaceMemberDetail, SpaceWithRole, SystemRole, TotpSetupResponse, TrashedGridItem,
+    UpdateColumnRequest, UpdateGridRequest, UpdateUserRoleRequest, User, UserProfile,
+    VerifyTotpRequest, WorkspaceBackupPayload,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +127,17 @@ impl ApiClient {
             .map_err(|e| e.to_string())
     }
 
+    fn put_json_req<B: Serialize>(
+        url: &str,
+        body: &B,
+        auth: &AuthState,
+    ) -> Result<Request, String> {
+        Self::attach_auth(Request::put(url), auth)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .map_err(|e| e.to_string())
+    }
+
     fn delete_json_req<B: Serialize>(
         url: &str,
         body: &B,
@@ -137,11 +156,19 @@ impl ApiClient {
     }
 
     // ========================================================================
-    // Auth Endpoints
+    // Auth, 2FA/TOTP & Password Recovery Endpoints
     // ========================================================================
 
-    pub async fn login(email: String, password: String) -> Result<LoginResponse, String> {
-        let payload = LoginRequest { email, password };
+    pub async fn login(
+        email: String,
+        password: String,
+        totp_code: Option<String>,
+    ) -> Result<LoginResponse, String> {
+        let payload = LoginRequest {
+            email,
+            password,
+            totp_code,
+        };
         let req = Request::post("/api/auth/login")
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -164,6 +191,141 @@ impl ApiClient {
         resp.json::<LoginResponse>()
             .await
             .map_err(|e| format!("Invalid login response: {e}"))
+    }
+
+    pub async fn get_public_auth_config() -> Result<PublicAuthConfig, String> {
+        let req = Request::get("/api/auth/public-config")
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {e}"))?;
+        if !resp.ok() {
+            return Ok(PublicAuthConfig::default());
+        }
+        resp.json::<PublicAuthConfig>()
+            .await
+            .map_err(|e| format!("Invalid auth config: {e}"))
+    }
+
+    pub async fn google_login(
+        credential: String,
+        email: Option<String>,
+        totp_code: Option<String>,
+        temp_2fa_token: Option<String>,
+    ) -> Result<LoginResponse, String> {
+        let payload = GoogleLoginRequest {
+            credential,
+            email,
+            totp_code,
+            temp_2fa_token,
+        };
+        let req = Request::post("/api/auth/google")
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .map_err(|e| e.to_string())?;
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {e}"))?;
+
+        if !resp.ok() {
+            let msg = resp
+                .json::<ApiErrorPayload>()
+                .await
+                .map(|p| p.error)
+                .unwrap_or_else(|_| "Google Sign-In failed".into());
+            return Err(msg);
+        }
+
+        resp.json::<LoginResponse>()
+            .await
+            .map_err(|e| format!("Invalid Google login response: {e}"))
+    }
+
+    pub async fn request_password_reset(email: String) -> Result<ForgotPasswordResponse, String> {
+        let payload = ForgotPasswordRequest { email };
+        let req = Request::post("/api/auth/forgot-password/request")
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .map_err(|e| e.to_string())?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {e}"))?;
+        if !resp.ok() {
+            let msg = resp
+                .json::<ApiErrorPayload>()
+                .await
+                .map(|p| p.error)
+                .unwrap_or_else(|_| "Failed to submit password reset request".into());
+            return Err(msg);
+        }
+        resp.json::<ForgotPasswordResponse>()
+            .await
+            .map_err(|e| format!("Invalid response: {e}"))
+    }
+
+    pub async fn self_service_reset_password(
+        email: String,
+        verification_code: String,
+        new_password: String,
+    ) -> Result<String, String> {
+        let payload = SelfServicePasswordResetRequest {
+            email,
+            verification_code,
+            new_password,
+        };
+        let req = Request::post("/api/auth/forgot-password/reset")
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .map_err(|e| e.to_string())?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {e}"))?;
+        if !resp.ok() {
+            let msg = resp
+                .json::<ApiErrorPayload>()
+                .await
+                .map(|p| p.error)
+                .unwrap_or_else(|_| "Invalid verification code or email".into());
+            return Err(msg);
+        }
+        Ok("Password reset successfully. You can now sign in with your new password.".into())
+    }
+
+    pub async fn change_own_password(
+        auth: &AuthState,
+        current_password: String,
+        new_password: String,
+    ) -> Result<(), String> {
+        let payload = ChangeOwnPasswordRequest {
+            current_password,
+            new_password,
+        };
+        let req = Self::post_json_req("/api/auth/password", &payload, auth)?;
+        let _: serde_json::Value = Self::send_json(req, auth).await?;
+        Ok(())
+    }
+
+    pub async fn setup_totp(auth: &AuthState) -> Result<TotpSetupResponse, String> {
+        let req = Self::post_json_req("/api/auth/2fa/setup", &serde_json::json!({}), auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn enable_totp(auth: &AuthState, code: String) -> Result<UserProfile, String> {
+        let payload = VerifyTotpRequest { code };
+        let req = Self::post_json_req("/api/auth/2fa/enable", &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn disable_totp(auth: &AuthState, password: String) -> Result<UserProfile, String> {
+        let payload = DisableTotpRequest { password };
+        let req = Self::post_json_req("/api/auth/2fa/disable", &payload, auth)?;
+        Self::send_json(req, auth).await
     }
 
     pub async fn fetch_me(auth: &AuthState) -> Result<UserProfile, String> {
@@ -284,6 +446,115 @@ impl ApiClient {
         Self::send_json(req, auth).await
     }
 
+    pub async fn delete_user(auth: &AuthState, user_id: Uuid) -> Result<(), String> {
+        let url = format!("/api/admin/users/{user_id}");
+        let req = Self::delete_req(&url, auth)?;
+        Self::send_empty(req, auth).await
+    }
+
+    pub async fn admin_reset_user_password(
+        auth: &AuthState,
+        user_id: Uuid,
+        new_password: String,
+    ) -> Result<AdminResetPasswordResponse, String> {
+        let url = format!("/api/admin/users/{user_id}/password");
+        let payload = AdminResetPasswordRequest { new_password };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn admin_manage_user_2fa(
+        auth: &AuthState,
+        user_id: Uuid,
+        action: String,
+    ) -> Result<AdminManage2faResponse, String> {
+        let url = format!("/api/admin/users/{user_id}/2fa");
+        let payload = AdminManage2faRequest { action, code: None };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn admin_verify_user_2fa(
+        auth: &AuthState,
+        user_id: Uuid,
+        code: String,
+    ) -> Result<AdminManage2faResponse, String> {
+        let url = format!("/api/admin/users/{user_id}/2fa");
+        let payload = AdminManage2faRequest {
+            action: "verify".into(),
+            code: Some(code),
+        };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn get_auth_settings(auth: &AuthState) -> Result<GoogleAuthSettings, String> {
+        let req = Self::get_req("/api/admin/auth-settings", auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn update_auth_settings(
+        auth: &AuthState,
+        payload: GoogleAuthSettings,
+    ) -> Result<GoogleAuthSettings, String> {
+        let req = Self::put_json_req("/api/admin/auth-settings", &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn get_ai_settings(auth: &AuthState) -> Result<AiSettings, String> {
+        let req = Self::get_req("/api/admin/ai-settings", auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn update_ai_settings(
+        auth: &AuthState,
+        payload: AiSettings,
+    ) -> Result<AiSettings, String> {
+        let req = Self::put_json_req("/api/admin/ai-settings", &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn get_ai_status(auth: &AuthState) -> Result<AiSettings, String> {
+        let req = Self::get_req("/api/ai/status", auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn run_ai_copilot(
+        auth: &AuthState,
+        prompt: String,
+        mode: String,
+        space_id: Option<Uuid>,
+        grid_id: Option<Uuid>,
+        history: Vec<AiChatMessage>,
+        attachments: Vec<AiAttachment>,
+    ) -> Result<AiCopilotResponse, String> {
+        let payload = AiCopilotRequest {
+            prompt,
+            mode,
+            space_id,
+            grid_id,
+            history,
+            attachments,
+        };
+        let req = Self::post_json_req("/api/ai/copilot", &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn export_workspace_backup(
+        auth: &AuthState,
+    ) -> Result<WorkspaceBackupPayload, String> {
+        let req = Self::get_req("/api/admin/backup", auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn restore_workspace_backup(
+        auth: &AuthState,
+        payload: WorkspaceBackupPayload,
+    ) -> Result<RestoreBackupResponse, String> {
+        let req = Self::post_json_req("/api/admin/restore", &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
     pub async fn list_audit_logs(auth: &AuthState) -> Result<Vec<AuditLogEntry>, String> {
         let req = Self::get_req("/api/admin/audit-logs?limit=200", auth)?;
         Self::send_json(req, auth).await
@@ -324,6 +595,50 @@ impl ApiClient {
         Self::send_empty(req, auth).await
     }
 
+    pub async fn duplicate_grid(
+        auth: &AuthState,
+        grid_id: Uuid,
+        target_space_id: Option<Uuid>,
+        new_name: Option<String>,
+        include_rows: bool,
+    ) -> Result<PageGrid, String> {
+        let url = format!("/api/grids/{grid_id}/duplicate");
+        let payload = DuplicateGridRequest {
+            target_space_id,
+            new_name,
+            include_rows,
+        };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn move_grid(
+        auth: &AuthState,
+        grid_id: Uuid,
+        target_space_id: Uuid,
+    ) -> Result<PageGrid, String> {
+        let url = format!("/api/grids/{grid_id}/move");
+        let payload = MoveGridRequest { target_space_id };
+        let req = Self::patch_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn copy_rows_to_grid(
+        auth: &AuthState,
+        source_grid_id: Uuid,
+        target_grid_id: Uuid,
+        row_ids: Vec<Uuid>,
+        auto_create_missing_columns: bool,
+    ) -> Result<CopyRowsToGridResponse, String> {
+        let url = format!("/api/grids/{source_grid_id}/rows/copy-to/{target_grid_id}");
+        let payload = CopyRowsToGridRequest {
+            row_ids,
+            auto_create_missing_columns,
+        };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
     pub async fn bulk_delete_grids(
         auth: &AuthState,
         space_id: Uuid,
@@ -332,6 +647,41 @@ impl ApiClient {
         let url = format!("/api/spaces/{space_id}/grids/bulk");
         let payload = BulkDeleteGridsRequest { grid_ids };
         let req = Self::delete_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn list_trashed_grids(auth: &AuthState) -> Result<Vec<TrashedGridItem>, String> {
+        let req = Self::get_req("/api/trash/grids", auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn restore_trashed_grid(
+        auth: &AuthState,
+        grid_id: Uuid,
+    ) -> Result<PageGrid, String> {
+        let url = format!("/api/trash/grids/{grid_id}/restore");
+        let req = Self::post_json_req(&url, &serde_json::json!({}), auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn permanently_delete_trashed_grid(
+        auth: &AuthState,
+        grid_id: Uuid,
+    ) -> Result<(), String> {
+        let url = format!("/api/trash/grids/{grid_id}/permanent");
+        let req = Self::delete_req(&url, auth)?;
+        Self::send_empty(req, auth).await
+    }
+
+    pub async fn empty_trash(
+        auth: &AuthState,
+        space_id: Option<Uuid>,
+    ) -> Result<EmptyTrashResponse, String> {
+        let url = match space_id {
+            Some(sid) => format!("/api/trash/empty?space_id={sid}"),
+            None => "/api/trash/empty".to_string(),
+        };
+        let req = Self::delete_req(&url, auth)?;
         Self::send_json(req, auth).await
     }
 
@@ -635,4 +985,175 @@ impl ApiClient {
         let req = Self::get_req(&url, auth)?;
         Self::send_json(req, auth).await
     }
+
+    // ========================================================================
+    // Phase 16: Row Comments Endpoints (`grid_row_comments`)
+    // ========================================================================
+
+    pub async fn list_grid_comment_counts(
+        auth: &AuthState,
+        grid_id: Uuid,
+    ) -> Result<HashMap<Uuid, i64>, String> {
+        let url = format!("/api/grids/{grid_id}/comments/counts");
+        let req = Self::get_req(&url, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn list_row_comments(
+        auth: &AuthState,
+        grid_id: Uuid,
+        row_id: Uuid,
+    ) -> Result<Vec<GridRowComment>, String> {
+        let url = format!("/api/grids/{grid_id}/rows/{row_id}/comments");
+        let req = Self::get_req(&url, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn create_row_comment(
+        auth: &AuthState,
+        grid_id: Uuid,
+        row_id: Uuid,
+        content: String,
+    ) -> Result<GridRowComment, String> {
+        let url = format!("/api/grids/{grid_id}/rows/{row_id}/comments");
+        let payload = CreateRowCommentRequest { content };
+        let req = Self::post_json_req(&url, &payload, auth)?;
+        Self::send_json(req, auth).await
+    }
+
+    pub async fn delete_row_comment(
+        auth: &AuthState,
+        grid_id: Uuid,
+        row_id: Uuid,
+        comment_id: Uuid,
+    ) -> Result<(), String> {
+        let url = format!("/api/grids/{grid_id}/rows/{row_id}/comments/{comment_id}");
+        let req = Self::delete_req(&url, auth)?;
+        Self::send_empty(req, auth).await
+    }
+}
+
+use leptos::prelude::{RwSignal, Update};
+use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsValue};
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = FileReader)]
+    type JsFileReader;
+
+    #[wasm_bindgen(constructor, js_class = "FileReader")]
+    fn new() -> JsFileReader;
+
+    #[wasm_bindgen(method, js_name = readAsDataURL)]
+    fn read_as_data_url(this: &JsFileReader, blob: &web_sys::Blob);
+
+    #[wasm_bindgen(method, setter, js_name = onload)]
+    fn set_onload(this: &JsFileReader, cb: &js_sys::Function);
+
+    #[wasm_bindgen(method, getter, js_name = result)]
+    fn result(this: &JsFileReader) -> JsValue;
+}
+
+pub fn read_browser_file_to_ai_attachment(
+    file: web_sys::File,
+    target_signal: RwSignal<Vec<AiAttachment>>,
+) {
+    let filename = {
+        let raw = file.name();
+        if raw.trim().is_empty() {
+            "clipboard-image.png".to_string()
+        } else {
+            raw
+        }
+    };
+    let mime_type = {
+        let raw = file.type_();
+        if raw.trim().is_empty() {
+            let lower = filename.to_ascii_lowercase();
+            if lower.ends_with(".png") {
+                "image/png".to_string()
+            } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                "image/jpeg".to_string()
+            } else if lower.ends_with(".webp") {
+                "image/webp".to_string()
+            } else if lower.ends_with(".gif") {
+                "image/gif".to_string()
+            } else if lower.ends_with(".csv") {
+                "text/csv".to_string()
+            } else if lower.ends_with(".tsv") {
+                "text/tab-separated-values".to_string()
+            } else if lower.ends_with(".json") {
+                "application/json".to_string()
+            } else if lower.ends_with(".md") || lower.ends_with(".txt") {
+                "text/plain".to_string()
+            } else {
+                "application/octet-stream".to_string()
+            }
+        } else {
+            raw
+        }
+    };
+
+    let reader = JsFileReader::new();
+    let reader_clone = reader.unchecked_ref::<JsValue>().clone();
+    let cb = Closure::once(move || {
+        let r: &JsFileReader = reader_clone.unchecked_ref();
+        if let Some(data_url) = r.result().as_string() {
+            let b64 = if let Some((_, after)) = data_url.split_once(";base64,") {
+                after.trim().to_string()
+            } else if let Some((_, after)) = data_url.split_once(',') {
+                after.trim().to_string()
+            } else {
+                data_url.trim().to_string()
+            };
+            if !b64.is_empty() {
+                target_signal.update(|list| {
+                    list.push(AiAttachment {
+                        filename,
+                        mime_type,
+                        data_base64: b64,
+                    });
+                });
+            }
+        }
+    });
+    reader.set_onload(cb.as_ref().unchecked_ref());
+    reader.read_as_data_url(file.as_ref());
+    cb.forget();
+}
+
+pub fn read_file_list_to_ai_attachments(
+    files: Option<web_sys::FileList>,
+    target_signal: RwSignal<Vec<AiAttachment>>,
+) {
+    let Some(list) = files else {
+        return;
+    };
+    let len = list.length();
+    for idx in 0..len {
+        if let Some(file) = list.get(idx) {
+            read_browser_file_to_ai_attachment(file, target_signal);
+        }
+    }
+}
+
+pub fn handle_clipboard_paste_to_ai_attachments(
+    ev: &web_sys::Event,
+    target_signal: RwSignal<Vec<AiAttachment>>,
+) -> bool {
+    let Ok(clip_data) = js_sys::Reflect::get(ev, &JsValue::from_str("clipboardData")) else {
+        return false;
+    };
+    if clip_data.is_null() || clip_data.is_undefined() {
+        return false;
+    }
+    if let Ok(files_val) = js_sys::Reflect::get(&clip_data, &JsValue::from_str("files")) {
+        if let Ok(file_list) = files_val.dyn_into::<web_sys::FileList>() {
+            if file_list.length() > 0 {
+                read_file_list_to_ai_attachments(Some(file_list), target_signal);
+                return true;
+            }
+        }
+    }
+    false
 }

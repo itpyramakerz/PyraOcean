@@ -6,9 +6,10 @@ use axum::{extract::State, Json};
 use chrono::{NaiveDate, NaiveTime, Utc};
 use pyra_ocean_shared::{
     compute_column_calculation, format_cell_for_export, format_number_with_commas, AiAttachment,
-    AiCopilotRequest, AiCopilotResponse, AiExecutedAction, AiSettings, CalcMode, CellValue,
-    ChecklistItem, ColumnCalcSummary, ColumnPropertyConfig, ColumnPropertyType, GridColumn,
-    GridRow, NumberFormat, PageGrid, RowCellMap, SelectOption, SystemRole, TagColor,
+    AiCopilotRequest, AiCopilotResponse, AiExecutedAction, AiNavigationTarget, AiSettings,
+    CalcMode, CellValue, ChecklistItem, ColumnCalcSummary, ColumnPropertyConfig,
+    ColumnPropertyType, GridColumn, GridRow, NumberFormat, PageGrid, RowCellMap, SelectOption,
+    SystemRole, TagColor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -520,6 +521,16 @@ enum LLMTaskSpec {
         #[serde(default = "default_text_type")]
         property_type: String,
     },
+    RenameColumn {
+        #[serde(alias = "old", alias = "from", alias = "name")]
+        old_name: String,
+        #[serde(alias = "new", alias = "to")]
+        new_name: String,
+    },
+    DeleteColumn {
+        #[serde(alias = "column", alias = "col")]
+        name: String,
+    },
     AddRow {
         #[serde(default)]
         values: HashMap<String, Value>,
@@ -537,6 +548,10 @@ enum LLMTaskSpec {
     DeleteRow {
         #[serde(default)]
         match_text: String,
+    },
+    Navigate {
+        #[serde(default, alias = "query", alias = "name", alias = "match_text")]
+        target: String,
     },
 }
 
@@ -1362,13 +1377,87 @@ pub async fn run_ai_copilot(
         .unwrap_or_default();
     let user_display_map: HashMap<Uuid, String> = user_rows.into_iter().collect();
 
-    // 1. Load Active Grid Context (if `grid_id` is provided and accessible)
+    // 1. Load Accessible Workspace Grids across ALL Spaces for Omnipotent Cross-Space Search, Navigation & Task Execution
+    let is_super_admin = auth_user.system_role == SystemRole::SuperAdmin;
+    let accessible_grids: Vec<(Uuid, Uuid, String, String, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT g.id, g.space_id, s.name AS space_name, g.title, g.icon
+        FROM pages_grids g
+        JOIN spaces s ON s.id = g.space_id
+        WHERE g.deleted_at IS NULL AND g.is_archived = FALSE AND s.is_archived = FALSE
+          AND (
+              $1 = TRUE
+              OR EXISTS (SELECT 1 FROM space_members sm WHERE sm.space_id = g.space_id AND sm.user_id = $2)
+              OR EXISTS (SELECT 1 FROM page_grid_permissions gp WHERE gp.grid_id = g.id AND gp.user_id = $2)
+          )
+        ORDER BY s.name ASC, g.position ASC
+        LIMIT 80
+        "#,
+    )
+    .bind(is_super_admin)
+    .bind(auth_user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let all_accessible_grid_ids: Vec<Uuid> =
+        accessible_grids.iter().map(|(gid, ..)| *gid).collect();
+
+    let all_workspace_columns: Vec<GridColumn> = if all_accessible_grid_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, GridColumn>(
+            "SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at FROM grid_columns WHERE grid_id = ANY($1) ORDER BY grid_id, position ASC, created_at ASC",
+        )
+        .bind(&all_accessible_grid_ids)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    };
+
+    let all_workspace_rows: Vec<GridRow> = if all_accessible_grid_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, GridRow>(
+            "SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified FROM grid_rows WHERE grid_id = ANY($1) ORDER BY grid_id, position ASC, row_order ASC, created_at ASC LIMIT 2500",
+        )
+        .bind(&all_accessible_grid_ids)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    };
+
+    let mut grid_columns_map: HashMap<Uuid, Vec<GridColumn>> = HashMap::new();
+    for col in all_workspace_columns {
+        grid_columns_map.entry(col.grid_id).or_default().push(col);
+    }
+
+    let mut grid_rows_map: HashMap<Uuid, Vec<GridRow>> = HashMap::new();
+    for r in all_workspace_rows {
+        grid_rows_map.entry(r.grid_id).or_default().push(r);
+    }
+
+    // 2. Load Active Grid Context (or auto-resolve target Grid from prompt across all Spaces)
     let mut active_grid: Option<PageGrid> = None;
     let mut active_columns: Vec<GridColumn> = Vec::new();
     let mut active_rows: Vec<GridRow> = Vec::new();
     let mut can_edit_active_grid = false;
 
-    if let Some(gid) = req.grid_id {
+    let lower_prompt_for_target = effective_prompt.to_ascii_lowercase();
+    let prompt_matched_grid_id: Option<Uuid> = accessible_grids
+        .iter()
+        .filter(|(_, _, _, gtitle, _)| {
+            let gt = gtitle.trim().to_ascii_lowercase();
+            gt.len() >= 3 && lower_prompt_for_target.contains(&gt)
+        })
+        .max_by_key(|(_, _, _, gtitle, _)| gtitle.len())
+        .map(|(gid, ..)| *gid);
+
+    let resolved_initial_grid_id = req
+        .grid_id
+        .or(prompt_matched_grid_id)
+        .or_else(|| accessible_grids.first().map(|(gid, ..)| *gid));
+
+    if let Some(gid) = resolved_initial_grid_id {
         if let Ok(access) = resolve_grid_access_cached(&state, auth_user.clone(), gid).await {
             can_edit_active_grid = access.effective_space_role.can_write();
             active_grid = sqlx::query_as::<_, PageGrid>(
@@ -1379,52 +1468,21 @@ pub async fn run_ai_copilot(
             .await?;
 
             if active_grid.is_some() {
-                active_columns = sqlx::query_as::<_, GridColumn>(
-                    "SELECT id, grid_id, name, property_type, property_config, width_px, position, is_primary, is_hidden, created_at, updated_at FROM grid_columns WHERE grid_id = $1 ORDER BY position ASC, created_at ASC",
-                )
-                .bind(gid)
-                .fetch_all(&state.db)
-                .await?;
-
-                active_rows = sqlx::query_as::<_, GridRow>(
-                    "SELECT id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified FROM grid_rows WHERE grid_id = $1 ORDER BY position ASC, row_order ASC, created_at ASC LIMIT 300",
-                )
-                .bind(gid)
-                .fetch_all(&state.db)
-                .await?;
+                active_columns = grid_columns_map.get(&gid).cloned().unwrap_or_default();
+                active_rows = grid_rows_map.get(&gid).cloned().unwrap_or_default();
             }
         }
     }
 
-    // 2. Load Accessible Workspace Grids for Global Search & Navigation Context
-    let is_super_admin = auth_user.system_role == SystemRole::SuperAdmin;
-    let accessible_grids: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
-        r#"
-        SELECT g.id, g.space_id, s.name AS space_name, g.title
-        FROM pages_grids g
-        JOIN spaces s ON s.id = g.space_id
-        WHERE g.deleted_at IS NULL AND g.is_archived = FALSE AND s.is_archived = FALSE
-          AND (
-              $1 = TRUE
-              OR EXISTS (SELECT 1 FROM space_members sm WHERE sm.space_id = g.space_id AND sm.user_id = $2)
-              OR EXISTS (SELECT 1 FROM page_grid_permissions gp WHERE gp.grid_id = g.id AND gp.user_id = $2)
-          )
-        ORDER BY s.name ASC, g.position ASC
-        LIMIT 60
-        "#,
-    )
-    .bind(is_super_admin)
-    .bind(auth_user.user_id)
-    .fetch_all(&state.db)
-    .await?;
-
-    // 3. Build Deterministic Context Digest & Pre-Computed Analytics Report
-    let (mut context_digest, mut analytics_markdown, matched_rows_count) =
+    // 3. Build Deterministic Context Digest, Cross-Space Search Targets & Pre-Computed Analytics Report
+    let (mut context_digest, mut analytics_markdown, matched_rows_count, mut navigation_targets) =
         build_workspace_context_and_report(
             &active_grid,
             &active_columns,
             &active_rows,
             &accessible_grids,
+            &grid_columns_map,
+            &grid_rows_map,
             &user_display_map,
             effective_prompt,
         );
@@ -1446,28 +1504,38 @@ pub async fn run_ai_copilot(
             || lower_prompt.contains("add rows")
             || lower_prompt.contains("add all"));
 
+    let pre_parsed_env = fallback_intent_parser(effective_prompt, &active_columns);
     let mut mode = req.mode.trim().to_ascii_lowercase();
     if mode != "execute"
-        && (prompt_is_explicit_task_command(effective_prompt) || wants_attachment_import)
+        && (prompt_is_explicit_task_command(effective_prompt)
+            || !pre_parsed_env.actions.is_empty()
+            || wants_attachment_import)
     {
         mode = "execute".to_string();
     }
     let mut executed_actions: Vec<AiExecutedAction> = Vec::new();
+    let mut navigated_space_id: Option<Uuid> = None;
     let mut navigated_grid_id: Option<Uuid> = None;
+    let mut navigated_row_id: Option<Uuid> = None;
 
-    // 4. Mode == "execute" -> Autonomous Task Execution (Create Grid, Add Column, Add/Update/Delete Row)
+    // 4. Mode == "execute" -> Autonomous Task Execution (Create Grid, Add/Rename/Delete Column, Add/Update/Delete Row, Navigate)
     if mode == "execute" {
         let exec_system_prompt = format!(
             "{}\n\nYou are operating in AUTONOMOUS TASK EXECUTION MODE for PyraOcean.\n\
+            When the user asks for multiple tasks in one prompt (e.g. adding multiple columns, renaming/deleting columns, adding/updating rows, or navigating), you MUST include EVERY requested task in order in the `actions` array (or inside a ```json_actions [ ... ] ``` array).\n\
             Convert the user's instruction into a valid JSON object with the exact structure:\n\
             {{\n\
-              \"explanation\": \"Brief summary of what you did\",\n\
+              \"explanation\": \"Brief summary of all tasks executed\",\n\
               \"actions\": [\n\
                 {{\"action\": \"create_grid\", \"name\": \"Project Tracker\", \"icon\": \"🚀\", \"columns\": [{{\"name\": \"Task\", \"property_type\": \"text\"}}, {{\"name\": \"Status\", \"property_type\": \"select\"}}, {{\"name\": \"Department\", \"property_type\": \"multi_select\"}}, {{\"name\": \"Budget\", \"property_type\": \"currency\"}}], \"rows\": [{{\"Task\": \"Launch MVP\", \"Status\": \"In Progress\", \"Department\": [\"Software\", \"Innovation\"], \"Budget\": 25000}}]}},\n\
-                {{\"action\": \"add_column\", \"name\": \"Priority\", \"property_type\": \"select\"}},\n\
+                {{\"action\": \"add_column\", \"name\": \"username\", \"property_type\": \"text\"}},\n\
+                {{\"action\": \"add_column\", \"name\": \"Size\", \"property_type\": \"text\"}},\n\
+                {{\"action\": \"rename_column\", \"old_name\": \"OldName\", \"new_name\": \"NewName\"}},\n\
+                {{\"action\": \"delete_column\", \"name\": \"ObsoleteColumn\"}},\n\
                 {{\"action\": \"add_row\", \"values\": {{\"Service\": \"Canva\", \"Department\": [\"Marketing\", \"B2C\"], \"Payment\": \"Yearly\", \"Cost\": 1500}}}},\n\
                 {{\"action\": \"update_row\", \"match_text\": \"ChatGPT\", \"values\": {{\"Department\": [\"Software\", \"B2C\", \"Innovation\"]}}, \"append_tags\": false, \"remove_tags\": false}},\n\
-                {{\"action\": \"delete_row\", \"match_text\": \"row keyword or row number\"}}\n\
+                {{\"action\": \"delete_row\", \"match_text\": \"row keyword or row number\"}},\n\
+                {{\"action\": \"navigate\", \"target\": \"Grid name, Space name, or Row keyword\"}}\n\
               ]\n\
             }}\n\
             For Select columns, pass the option label string (e.g. \"Marketing\" or \"Yearly\").\n\
@@ -1475,7 +1543,7 @@ pub async fn run_ai_copilot(
             If the user asks to ADD/APPEND a tag to an existing MultiSelect cell without replacing existing tags, set \"append_tags\": true on update_row.\n\
             If the user asks to REMOVE a tag from an existing MultiSelect cell, set \"remove_tags\": true on update_row.\n\
             Allowed property_type values: text, number, currency, select, multi_select, date, checkbox, checklist, person, password.\n\
-            Output ONLY raw JSON without markdown fences if possible.\n\n\
+            Output ONLY raw JSON or a ```json_actions [ ... ] ``` block.\n\n\
             CURRENT WORKSPACE CONTEXT:\n{}",
             settings.system_prompt, context_digest
         );
@@ -1505,7 +1573,7 @@ pub async fn run_ai_copilot(
             images: attached_images.clone(),
         });
 
-        let mut deterministic_env = fallback_intent_parser(effective_prompt, &active_columns);
+        let mut deterministic_env = pre_parsed_env;
         if deterministic_env.actions.is_empty() && !parsed_attachment_rows.is_empty() {
             deterministic_env = LLMCommandEnvelope {
                 explanation: Some(format!(
@@ -1532,19 +1600,95 @@ pub async fn run_ai_copilot(
             }
         };
 
+        let mut next_col_position = active_columns
+            .iter()
+            .map(|c| c.position)
+            .max()
+            .unwrap_or(-1)
+            + 1;
+
         for spec in envelope.actions {
             match spec {
+                LLMTaskSpec::Navigate { target } => {
+                    let needle = target.trim().to_ascii_lowercase();
+                    // 1. Check if `target` matches any Grid title or Space name
+                    let grid_hit = accessible_grids
+                        .iter()
+                        .find(|(_, _, sname, gtitle, _)| {
+                            gtitle.eq_ignore_ascii_case(target.trim())
+                                || gtitle.to_ascii_lowercase().contains(&needle)
+                                || sname.eq_ignore_ascii_case(target.trim())
+                                || sname.to_ascii_lowercase().contains(&needle)
+                        });
+                    if let Some((gid, sid, sname, gtitle, gicon)) = grid_hit {
+                        navigated_space_id = Some(*sid);
+                        navigated_grid_id = Some(*gid);
+                        navigated_row_id = None;
+                        let nav_item = AiNavigationTarget {
+                            space_id: *sid,
+                            space_name: sname.clone(),
+                            grid_id: *gid,
+                            grid_name: gtitle.clone(),
+                            grid_icon: gicon.clone(),
+                            row_id: None,
+                            row_number: None,
+                            primary_label: gtitle.clone(),
+                            matched_preview: format!("Space: {} → Grid: {}", sname, gtitle),
+                        };
+                        if !navigation_targets
+                            .iter()
+                            .any(|t| t.grid_id == *gid && t.row_id.is_none())
+                        {
+                            navigation_targets.insert(0, nav_item);
+                        }
+                        executed_actions.push(AiExecutedAction {
+                            action_type: "navigate".into(),
+                            summary: format!("Navigated to {} / {}", sname, gtitle),
+                            space_id: Some(*sid),
+                            grid_id: Some(*gid),
+                            row_id: None,
+                        });
+                    } else if let Some(first_row_hit) = navigation_targets.first().cloned() {
+                        navigated_space_id = Some(first_row_hit.space_id);
+                        navigated_grid_id = Some(first_row_hit.grid_id);
+                        navigated_row_id = first_row_hit.row_id;
+                        executed_actions.push(AiExecutedAction {
+                            action_type: "navigate".into(),
+                            summary: format!(
+                                "Navigated to '{}' in {} / {}",
+                                first_row_hit.primary_label,
+                                first_row_hit.space_name,
+                                first_row_hit.grid_name
+                            ),
+                            space_id: Some(first_row_hit.space_id),
+                            grid_id: Some(first_row_hit.grid_id),
+                            row_id: first_row_hit.row_id,
+                        });
+                    }
+                }
+
                 LLMTaskSpec::CreateGrid {
                     name,
                     icon,
                     columns,
                     rows,
                 } => {
-                    let target_space_id = if let Some(sid) = req.space_id {
+                    // Check if user specified a Space name in the prompt
+                    let matched_space_from_prompt = accessible_grids
+                        .iter()
+                        .find(|(_, _, sname, _, _)| {
+                            let sl = sname.to_ascii_lowercase();
+                            sl.len() >= 3 && lower_prompt.contains(&sl)
+                        })
+                        .map(|(_, sid, _, _, _)| *sid);
+
+                    let target_space_id = if let Some(sid) = matched_space_from_prompt {
+                        sid
+                    } else if let Some(sid) = req.space_id {
                         sid
                     } else if let Some(ref g) = active_grid {
                         g.space_id
-                    } else if let Some((_, sid, _, _)) = accessible_grids.first() {
+                    } else if let Some((_, sid, ..)) = accessible_grids.first() {
                         *sid
                     } else {
                         let found: Option<(Uuid,)> =
@@ -1665,8 +1809,37 @@ pub async fn run_ai_copilot(
                         inserted_rows_count += 1;
                     }
 
+                    let space_name_str = accessible_grids
+                        .iter()
+                        .find(|(_, sid, ..)| *sid == target_space_id)
+                        .map(|(_, _, sname, ..)| sname.clone())
+                        .unwrap_or_else(|| "Workspace".into());
+
                     state.cache.invalidate_space(&target_space_id);
+                    navigated_space_id = Some(target_space_id);
                     navigated_grid_id = Some(new_grid.id);
+                    active_grid = Some(new_grid.clone());
+                    active_columns = created_cols.clone();
+                    next_col_position = active_columns.len() as i32;
+                    can_edit_active_grid = true;
+                    navigation_targets.insert(
+                        0,
+                        AiNavigationTarget {
+                            space_id: target_space_id,
+                            space_name: space_name_str,
+                            grid_id: new_grid.id,
+                            grid_name: clean_name.clone(),
+                            grid_icon: Some(clean_icon),
+                            row_id: None,
+                            row_number: None,
+                            primary_label: clean_name.clone(),
+                            matched_preview: format!(
+                                "Created with {} columns and {} rows",
+                                created_cols.len(),
+                                inserted_rows_count
+                            ),
+                        },
+                    );
                     executed_actions.push(AiExecutedAction {
                         action_type: "create_grid".into(),
                         summary: format!(
@@ -1675,6 +1848,7 @@ pub async fn run_ai_copilot(
                             created_cols.len(),
                             inserted_rows_count
                         ),
+                        space_id: Some(target_space_id),
                         grid_id: Some(new_grid.id),
                         row_id: None,
                     });
@@ -1694,17 +1868,18 @@ pub async fn run_ai_copilot(
                             required: "space editor or space_admin",
                         });
                     }
-                    let clean_col_name = name.trim();
+                    let clean_col_name = name
+                        .trim()
+                        .trim_start_matches(['=', ':'])
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .trim();
                     if clean_col_name.is_empty() {
                         continue;
                     }
                     let (ptype, pcfg) = parse_property_type_and_config(&property_type);
-                    let next_order = active_columns
-                        .iter()
-                        .map(|c| c.position)
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
+                    let col_pos = next_col_position;
+                    next_col_position += 1;
 
                     let new_col: GridColumn = sqlx::query_as(
                         r#"
@@ -1717,18 +1892,136 @@ pub async fn run_ai_copilot(
                     .bind(clean_col_name)
                     .bind(ptype)
                     .bind(sqlx::types::Json(pcfg))
-                    .bind(next_order)
+                    .bind(col_pos)
                     .fetch_one(&state.db)
                     .await?;
 
                     active_columns.push(new_col);
                     state.cache.invalidate_grid(&g.id);
+                    if req.grid_id != Some(g.id) {
+                        navigated_space_id = Some(g.space_id);
+                        navigated_grid_id = Some(g.id);
+                    }
                     executed_actions.push(AiExecutedAction {
                         action_type: "add_column".into(),
-                        summary: format!("Added column '{}' ({:?})", clean_col_name, ptype),
+                        summary: format!(
+                            "Added column '{}' ({:?}) to '{}'",
+                            clean_col_name, ptype, g.title
+                        ),
+                        space_id: Some(g.space_id),
                         grid_id: Some(g.id),
                         row_id: None,
                     });
+                }
+
+                LLMTaskSpec::RenameColumn { old_name, new_name } => {
+                    let Some(ref g) = active_grid else {
+                        return Err(AuthError::BadRequest(
+                            "Open a Grid first before asking PyraAI to rename a column.".into(),
+                        ));
+                    };
+                    if !can_edit_active_grid {
+                        return Err(AuthError::Forbidden {
+                            required: "space editor or space_admin",
+                        });
+                    }
+                    let clean_old = old_name.trim().trim_matches(['"', '\'']).trim();
+                    let clean_new = new_name
+                        .trim()
+                        .trim_start_matches(['=', ':'])
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .trim();
+                    if clean_old.is_empty() || clean_new.is_empty() {
+                        continue;
+                    }
+                    if let Some(col) = active_columns.iter_mut().find(|c| {
+                        c.name.eq_ignore_ascii_case(clean_old)
+                            || c.name
+                                .to_ascii_lowercase()
+                                .contains(&clean_old.to_ascii_lowercase())
+                    }) {
+                        let prev_name = col.name.clone();
+                        sqlx::query(
+                            "UPDATE grid_columns SET name = $1, updated_at = NOW() WHERE id = $2 AND grid_id = $3",
+                        )
+                        .bind(clean_new)
+                        .bind(col.id)
+                        .bind(g.id)
+                        .execute(&state.db)
+                        .await?;
+
+                        col.name = clean_new.to_string();
+                        state.cache.invalidate_grid(&g.id);
+                        if req.grid_id != Some(g.id) {
+                            navigated_space_id = Some(g.space_id);
+                            navigated_grid_id = Some(g.id);
+                        }
+                        executed_actions.push(AiExecutedAction {
+                            action_type: "rename_column".into(),
+                            summary: format!("Renamed column '{}' to '{}'", prev_name, clean_new),
+                            space_id: Some(g.space_id),
+                            grid_id: Some(g.id),
+                            row_id: None,
+                        });
+                    }
+                }
+
+                LLMTaskSpec::DeleteColumn { name } => {
+                    let Some(ref g) = active_grid else {
+                        return Err(AuthError::BadRequest(
+                            "Open a Grid first before asking PyraAI to delete a column.".into(),
+                        ));
+                    };
+                    if !can_edit_active_grid {
+                        return Err(AuthError::Forbidden {
+                            required: "space editor or space_admin",
+                        });
+                    }
+                    let clean_col = name
+                        .trim()
+                        .trim_start_matches(['=', ':'])
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .trim();
+                    if clean_col.is_empty() {
+                        continue;
+                    }
+                    if let Some(pos) = active_columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(clean_col))
+                    {
+                        let removed_col = active_columns.remove(pos);
+                        sqlx::query("DELETE FROM grid_columns WHERE id = $1 AND grid_id = $2")
+                            .bind(removed_col.id)
+                            .bind(g.id)
+                            .execute(&state.db)
+                            .await?;
+
+                        sqlx::query(
+                            "UPDATE grid_rows SET cells = cells - $1, last_modified = NOW() WHERE grid_id = $2",
+                        )
+                        .bind(removed_col.id.to_string())
+                        .bind(g.id)
+                        .execute(&state.db)
+                        .await?;
+
+                        for r in &mut active_rows {
+                            r.cells.remove(&removed_col.id);
+                        }
+                        state.cache.invalidate_grid(&g.id);
+                        if req.grid_id != Some(g.id) {
+                            navigated_space_id = Some(g.space_id);
+                            navigated_grid_id = Some(g.id);
+                        }
+                        executed_actions.push(AiExecutedAction {
+                            action_type: "delete_column".into(),
+                            summary: format!("Deleted column '{}'", removed_col.name),
+                            space_id: Some(g.space_id),
+                            grid_id: Some(g.id),
+                            row_id: None,
+                        });
+                    }
                 }
 
                 LLMTaskSpec::AddRow { values } => {
@@ -1788,11 +2081,11 @@ pub async fn run_ai_copilot(
                     .fetch_one(&state.db)
                     .await?;
 
-                    let inserted_row_id: (Uuid,) = sqlx::query_as(
+                    let inserted_row: GridRow = sqlx::query_as(
                         r#"
                         INSERT INTO grid_rows (grid_id, position, row_order, cells, created_by, updated_by)
                         VALUES ($1, $2, $3, $4, $5, $5)
-                        RETURNING id
+                        RETURNING id, grid_id, position, row_order, cells, created_by, updated_by, created_at, last_modified
                         "#,
                     )
                     .bind(g.id)
@@ -1803,12 +2096,47 @@ pub async fn run_ai_copilot(
                     .fetch_one(&state.db)
                     .await?;
 
+                    let new_row_id = inserted_row.id;
+                    let row_num = active_rows.len() + 1;
+                    let (prim_label, preview_str) = summarize_row_for_navigation(
+                        &active_columns,
+                        &inserted_row,
+                        row_num,
+                        &user_display_map,
+                    );
+                    let space_name_str = accessible_grids
+                        .iter()
+                        .find(|(gid, ..)| *gid == g.id)
+                        .map(|(_, _, sname, ..)| sname.clone())
+                        .unwrap_or_else(|| "Workspace".into());
+
+                    active_rows.push(inserted_row);
                     state.cache.invalidate_grid(&g.id);
+                    if req.grid_id != Some(g.id) {
+                        navigated_space_id = Some(g.space_id);
+                        navigated_grid_id = Some(g.id);
+                    }
+                    navigated_row_id = Some(new_row_id);
+                    navigation_targets.insert(
+                        0,
+                        AiNavigationTarget {
+                            space_id: g.space_id,
+                            space_name: space_name_str,
+                            grid_id: g.id,
+                            grid_name: g.title.clone(),
+                            grid_icon: g.icon.clone(),
+                            row_id: Some(new_row_id),
+                            row_number: Some(row_num),
+                            primary_label: prim_label,
+                            matched_preview: preview_str,
+                        },
+                    );
                     executed_actions.push(AiExecutedAction {
                         action_type: "add_row".into(),
                         summary: format!("Inserted new row into '{}'", g.title),
+                        space_id: Some(g.space_id),
                         grid_id: Some(g.id),
-                        row_id: Some(inserted_row_id.0),
+                        row_id: Some(new_row_id),
                     });
                 }
 
@@ -1818,16 +2146,6 @@ pub async fn run_ai_copilot(
                     append_tags,
                     remove_tags,
                 } => {
-                    let Some(ref g) = active_grid else {
-                        return Err(AuthError::BadRequest(
-                            "Open a Grid first before asking PyraAI to update rows.".into(),
-                        ));
-                    };
-                    if !can_edit_active_grid {
-                        return Err(AuthError::Forbidden {
-                            required: "space editor or space_admin",
-                        });
-                    }
                     let needle = match_text.trim().to_ascii_lowercase();
                     let row_index_match: Option<usize> = needle
                         .strip_prefix("row #")
@@ -1839,10 +2157,14 @@ pub async fn run_ai_copilot(
                         .ok()
                         .filter(|n| *n >= 1);
 
-                    let target_row = if let Some(one_based) = row_index_match {
-                        active_rows.get(one_based - 1)
+                    let mut target_row_idx = if let Some(one_based) = row_index_match {
+                        if one_based - 1 < active_rows.len() {
+                            Some(one_based - 1)
+                        } else {
+                            None
+                        }
                     } else {
-                        active_rows.iter().find(|r| {
+                        active_rows.iter().position(|r| {
                             if needle.is_empty() {
                                 return false;
                             }
@@ -1859,8 +2181,74 @@ pub async fn run_ai_copilot(
                         })
                     };
 
-                    if let Some(row) = target_row {
-                        let mut updated_cells = row.cells.clone();
+                    // Omnipotent Cross-Space Fallback: if not found in active_grid, search across ALL accessible Spaces & Grids!
+                    if target_row_idx.is_none() && !needle.is_empty() {
+                        for (cand_gid, _cand_sid, _cand_sname, _cand_gtitle, _cand_icon) in
+                            &accessible_grids
+                        {
+                            if active_grid.as_ref().map(|g| g.id) == Some(*cand_gid) {
+                                continue;
+                            }
+                            let Some(cand_cols) = grid_columns_map.get(cand_gid) else {
+                                continue;
+                            };
+                            let Some(cand_rows) = grid_rows_map.get(cand_gid) else {
+                                continue;
+                            };
+                            if let Some(found_idx) = cand_rows.iter().position(|r| {
+                                cand_cols.iter().any(|col| {
+                                    resolve_row_cell_display(
+                                        col,
+                                        r.cells.get(&col.id),
+                                        &user_display_map,
+                                        r.last_modified,
+                                    )
+                                    .to_ascii_lowercase()
+                                    .contains(&needle)
+                                })
+                            }) {
+                                if let Ok(access) = resolve_grid_access_cached(
+                                    &state,
+                                    auth_user.clone(),
+                                    *cand_gid,
+                                )
+                                .await
+                                {
+                                    if access.effective_space_role.can_write() {
+                                        if let Ok(Some( switched_grid )) = sqlx::query_as::<_, PageGrid>(
+                                            "SELECT id, space_id, title, description, icon, position, created_by, is_archived, created_at, updated_at, deleted_at, deleted_by FROM pages_grids WHERE id = $1 AND deleted_at IS NULL",
+                                        )
+                                        .bind(*cand_gid)
+                                        .fetch_optional(&state.db)
+                                        .await
+                                        {
+                                            active_grid = Some(switched_grid);
+                                            active_columns = cand_cols.clone();
+                                            active_rows = cand_rows.clone();
+                                            can_edit_active_grid = true;
+                                            target_row_idx = Some(found_idx);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let Some(ref g) = active_grid else {
+                        return Err(AuthError::BadRequest(
+                            "Open a Grid first before asking PyraAI to update rows.".into(),
+                        ));
+                    };
+                    if !can_edit_active_grid {
+                        return Err(AuthError::Forbidden {
+                            required: "space editor or space_admin",
+                        });
+                    }
+
+                    if let Some(r_idx) = target_row_idx {
+                        let row_id = active_rows[r_idx].id;
+                        let mut updated_cells = active_rows[r_idx].cells.clone();
                         for (k, v) in &values {
                             if let Some(col) = active_columns.iter_mut().find(|c| {
                                 c.name.eq_ignore_ascii_case(k.trim())
@@ -1887,17 +2275,53 @@ pub async fn run_ai_copilot(
                         )
                         .bind(sqlx::types::Json(&updated_cells))
                         .bind(auth_user.user_id)
-                        .bind(row.id)
+                        .bind(row_id)
                         .bind(g.id)
                         .execute(&state.db)
                         .await?;
 
+                        active_rows[r_idx].cells = updated_cells;
+                        let (prim_label, preview_str) = summarize_row_for_navigation(
+                            &active_columns,
+                            &active_rows[r_idx],
+                            r_idx + 1,
+                            &user_display_map,
+                        );
+                        let space_name_str = accessible_grids
+                            .iter()
+                            .find(|(gid, ..)| *gid == g.id)
+                            .map(|(_, _, sname, ..)| sname.clone())
+                            .unwrap_or_else(|| "Workspace".into());
+
                         state.cache.invalidate_grid(&g.id);
+                        if req.grid_id != Some(g.id) {
+                            navigated_space_id = Some(g.space_id);
+                            navigated_grid_id = Some(g.id);
+                        }
+                        navigated_row_id = Some(row_id);
+                        navigation_targets.insert(
+                            0,
+                            AiNavigationTarget {
+                                space_id: g.space_id,
+                                space_name: space_name_str.clone(),
+                                grid_id: g.id,
+                                grid_name: g.title.clone(),
+                                grid_icon: g.icon.clone(),
+                                row_id: Some(row_id),
+                                row_number: Some(r_idx + 1),
+                                primary_label: prim_label,
+                                matched_preview: preview_str,
+                            },
+                        );
                         executed_actions.push(AiExecutedAction {
                             action_type: "update_row".into(),
-                            summary: format!("Updated row matching '{}'", match_text),
+                            summary: format!(
+                                "Updated row matching '{}' in {} / {}",
+                                match_text, space_name_str, g.title
+                            ),
+                            space_id: Some(g.space_id),
                             grid_id: Some(g.id),
-                            row_id: Some(row.id),
+                            row_id: Some(row_id),
                         });
                     }
                 }
@@ -1958,6 +2382,7 @@ pub async fn run_ai_copilot(
                             .execute(&state.db)
                             .await?;
 
+                            active_rows.retain(|r| !matching_ids.contains(&r.id));
                             state.cache.invalidate_grid(&g.id);
                             executed_actions.push(AiExecutedAction {
                                 action_type: "delete_row".into(),
@@ -1966,6 +2391,7 @@ pub async fn run_ai_copilot(
                                     res.rows_affected(),
                                     match_text
                                 ),
+                                space_id: Some(g.space_id),
                                 grid_id: Some(g.id),
                                 row_id: matching_ids.first().copied(),
                             });
@@ -1984,9 +2410,11 @@ pub async fn run_ai_copilot(
             }
             summary_lines.join("\n")
         } else if matched_rows_count > 0
+            || !navigation_targets.is_empty()
             || prompt_trimmed.to_ascii_lowercase().starts_with("search ")
             || prompt_trimmed.to_ascii_lowercase().starts_with("show ")
             || prompt_trimmed.to_ascii_lowercase().starts_with("find ")
+            || prompt_trimmed.to_ascii_lowercase().starts_with("where ")
             || prompt_trimmed.to_ascii_lowercase().starts_with("list ")
         {
             analytics_markdown.clone()
@@ -2001,19 +2429,43 @@ pub async fn run_ai_copilot(
             model_used: settings.model_name,
             executed_actions,
             matched_rows_count,
+            navigated_space_id,
             navigated_grid_id,
+            navigated_row_id,
+            navigation_targets,
         }));
     }
 
-    // 5. Mode == "report" or "ask" -> Natural Language Search & Executive Report Generation
+    // 5. Mode == "report" or "ask" -> Natural Language Cross-Space Search & Executive Report Generation
+    let is_direct_lookup = lower_prompt.starts_with("where is ")
+        || lower_prompt.starts_with("find ")
+        || lower_prompt.starts_with("locate ")
+        || lower_prompt.starts_with("go to ")
+        || lower_prompt.starts_with("open ")
+        || lower_prompt.starts_with("navigate to ")
+        || lower_prompt.starts_with("take me to ")
+        || lower_prompt.starts_with("jump to ");
+
+    if let Some(best_target) = navigation_targets.first() {
+        if is_direct_lookup
+            || (navigation_targets.len() == 1 && req.grid_id != Some(best_target.grid_id))
+        {
+            navigated_space_id = Some(best_target.space_id);
+            navigated_grid_id = Some(best_target.grid_id);
+            navigated_row_id = best_target.row_id;
+        } else if req.grid_id == Some(best_target.grid_id) && best_target.row_id.is_some() {
+            navigated_row_id = best_target.row_id;
+        }
+    }
+
     let mode_instruction = if mode == "report" {
         "Generate a comprehensive, executive-ready Markdown report with: (1) Executive Overview, (2) Financial & Numeric Totals (including Dual-Currency EGP / USD totals and averages where present), (3) Category / Department Breakdown, and (4) Key Actionable Recommendations."
     } else {
-        "Answer the user's question accurately using the provided PyraOcean Grid & Workspace data. Cite exact row names, numbers, statuses, and dates from the context."
+        "Answer the user's question accurately using the provided PyraOcean Grid & Cross-Space Workspace data. Always cite exact Space names, Grid names, Row numbers, statuses, and values so the user knows exactly where each match lives."
     };
 
     let full_system_prompt = format!(
-        "{}\n\n{}\n\nWORKSPACE & GRID DATA CONTEXT:\n{}\n\nPRE-COMPUTED ANALYTICS & TOTALS:\n{}",
+        "{}\n\n{}\n\nWORKSPACE & GRID DATA CONTEXT:\n{}\n\nPRE-COMPUTED ANALYTICS & CROSS-SPACE MATCHES:\n{}",
         settings.system_prompt, mode_instruction, context_digest, analytics_markdown
     );
 
@@ -2048,7 +2500,10 @@ pub async fn run_ai_copilot(
             model_used: settings.model_name,
             executed_actions,
             matched_rows_count,
-            navigated_grid_id: None,
+            navigated_space_id,
+            navigated_grid_id,
+            navigated_row_id,
+            navigation_targets,
         })),
         Err(ollama_err) => {
             let fallback_answer = format!(
@@ -2060,7 +2515,10 @@ pub async fn run_ai_copilot(
                 model_used: format!("{} (Built-in Analytics Fallback)", settings.model_name),
                 executed_actions,
                 matched_rows_count,
-                navigated_grid_id: None,
+                navigated_space_id,
+                navigated_grid_id,
+                navigated_row_id,
+                navigation_targets,
             }))
         }
     }
@@ -2070,24 +2528,105 @@ pub async fn run_ai_copilot(
 // 5. Context Builder, Deterministic Analytics & Fallback Intent Parser
 // ============================================================================
 
+fn summarize_row_for_navigation(
+    columns: &[GridColumn],
+    row: &GridRow,
+    one_based_index: usize,
+    user_display_map: &HashMap<Uuid, String>,
+) -> (String, String) {
+    let mut primary_label = String::new();
+    let mut preview_parts: Vec<String> = Vec::new();
+
+    for col in columns.iter().filter(|c| !c.is_hidden) {
+        let val_str = resolve_row_cell_display(
+            col,
+            row.cells.get(&col.id),
+            user_display_map,
+            row.last_modified,
+        )
+        .replace(['\t', '\n', '\r'], " ");
+        let clean = val_str.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        if primary_label.is_empty() && (col.is_primary || preview_parts.is_empty()) {
+            primary_label = clean.to_string();
+        }
+        if preview_parts.len() < 4 {
+            preview_parts.push(format!("{}: {}", col.name, clean));
+        }
+    }
+
+    if primary_label.is_empty() {
+        primary_label = format!("Row #{}", one_based_index);
+    }
+    let preview = if preview_parts.is_empty() {
+        format!("Row #{}", one_based_index)
+    } else {
+        preview_parts.join(" · ")
+    };
+    (primary_label, preview)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_workspace_context_and_report(
     active_grid: &Option<PageGrid>,
     columns: &[GridColumn],
     rows: &[GridRow],
-    accessible_grids: &[(Uuid, Uuid, String, String)],
+    accessible_grids: &[(Uuid, Uuid, String, String, Option<String>)],
+    grid_columns_map: &HashMap<Uuid, Vec<GridColumn>>,
+    grid_rows_map: &HashMap<Uuid, Vec<GridRow>>,
     user_display_map: &HashMap<Uuid, String>,
     prompt: &str,
-) -> (String, String, usize) {
+) -> (String, String, usize, Vec<AiNavigationTarget>) {
     let mut ctx = String::new();
     let mut report = String::new();
     let mut matched_count = 0usize;
+    let mut navigation_targets: Vec<AiNavigationTarget> = Vec::new();
 
-    ctx.push_str("Accessible Workspace Grids:\n");
-    for (gid, _sid, sname, gname) in accessible_grids.iter().take(30) {
-        ctx.push_str(&format!("- [{}] {} / {}\n", gid, sname, gname));
+    ctx.push_str("Accessible PyraOcean Workspace Spaces & Grids:\n");
+    for (gid, _sid, sname, gname, gicon) in accessible_grids.iter().take(40) {
+        let rcount = grid_rows_map.get(gid).map(|v| v.len()).unwrap_or(0);
+        let cnames = grid_columns_map
+            .get(gid)
+            .map(|cols| {
+                cols.iter()
+                    .filter(|c| !c.is_hidden)
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        ctx.push_str(&format!(
+            "- [{}] {} / {} {} (Rows: {}, Columns: [{}])\n",
+            gid,
+            sname,
+            gicon.as_deref().unwrap_or("📄"),
+            gname,
+            rcount,
+            cnames
+        ));
     }
 
+    let stop_words = [
+        "what", "where", "which", "show", "find", "list", "give", "report", "summary", "the",
+        "and", "for", "with", "from", "that", "this", "have", "rows", "grid", "all", "about",
+        "search", "filter", "department", "status", "payment", "category", "tags", "tag", "are",
+        "open", "goto", "navigate", "take", "jump", "space", "into", "please", "can", "you",
+    ];
+    let keywords: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|w| w.len() >= 2 && !stop_words.contains(&w.as_str()))
+        .collect();
+
     if let Some(grid) = active_grid {
+        let active_space_name = accessible_grids
+            .iter()
+            .find(|(gid, ..)| *gid == grid.id)
+            .map(|(_, _, sname, ..)| sname.clone())
+            .unwrap_or_else(|| "Workspace".into());
+
         let visible_cols: Vec<&GridColumn> = columns.iter().filter(|c| !c.is_hidden).collect();
         let col_schema_line = visible_cols
             .iter()
@@ -2108,16 +2647,18 @@ fn build_workspace_context_and_report(
             .join(", ");
 
         ctx.push_str(&format!(
-            "\nActive Grid: {} (Total Rows: {})\nColumns & Available Tag Options: {}\n",
+            "\nActive Grid: {} / {} (Total Rows: {})\nColumns & Available Tag Options: {}\n",
+            active_space_name,
             grid.title,
             rows.len(),
             col_schema_line
         ));
 
         report.push_str(&format!(
-            "### 📊 Executive Summary: {} {}\n- **Total Rows:** `{}`\n- **Columns (`{}`):** {}\n\n",
+            "### 📊 Executive Summary: {} {} (`{}`)\n- **Total Rows:** `{}`\n- **Columns (`{}`):** {}\n\n",
             grid.icon.as_deref().unwrap_or("📄"),
             grid.title,
+            active_space_name,
             rows.len(),
             columns.len(),
             columns
@@ -2236,25 +2777,13 @@ fn build_workspace_context_and_report(
             }
         }
 
-        // Filter matching rows for the user's query keywords across all 12 property types (including Select & MultiSelect option labels)
-        let stop_words = [
-            "what", "where", "which", "show", "find", "list", "give", "report", "summary", "the",
-            "and", "for", "with", "from", "that", "this", "have", "rows", "grid", "all", "about",
-            "search", "filter", "department", "status", "payment", "category", "tags", "tag", "are",
-        ];
-        let keywords: Vec<String> = prompt
-            .split(|c: char| !c.is_alphanumeric())
-            .map(|w| w.trim().to_ascii_lowercase())
-            .filter(|w| w.len() >= 2 && !stop_words.contains(&w.as_str()))
-            .collect();
-
         let header_tsv = visible_cols
             .iter()
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
             .join("\t");
         ctx.push_str(&format!(
-            "\nRows (Compact TSV, up to 60 relevant rows):\n#\t{}\n",
+            "\nActive Grid Rows (Compact TSV, up to 60 relevant rows):\n#\t{}\n",
             header_tsv
         ));
         let mut matched_rows_md: Vec<String> = Vec::new();
@@ -2284,8 +2813,30 @@ fn build_workspace_context_and_report(
                 keywords.iter().any(|kw| lower_line.contains(kw))
             };
             if is_kw_match {
+                let (prim_label, preview_str) =
+                    summarize_row_for_navigation(columns, r, idx + 1, user_display_map);
+                if navigation_targets.len() < 15 {
+                    navigation_targets.push(AiNavigationTarget {
+                        space_id: grid.space_id,
+                        space_name: active_space_name.clone(),
+                        grid_id: grid.id,
+                        grid_name: grid.title.clone(),
+                        grid_icon: grid.icon.clone(),
+                        row_id: Some(r.id),
+                        row_number: Some(idx + 1),
+                        primary_label: prim_label,
+                        matched_preview: preview_str,
+                    });
+                }
                 if matched_rows_md.len() < 50 {
-                    matched_rows_md.push(format!("{}. {}", idx + 1, row_line));
+                    matched_rows_md.push(format!(
+                        "{}. **[{} / {} — Row #{}]** {}",
+                        idx + 1,
+                        active_space_name,
+                        grid.title,
+                        idx + 1,
+                        row_line
+                    ));
                 }
                 if tsv_matched_lines.len() < 60 {
                     tsv_matched_lines.push(tsv_line);
@@ -2309,36 +2860,226 @@ fn build_workspace_context_and_report(
         }
 
         if !matched_rows_md.is_empty() {
-            matched_count = matched_rows_md.len();
+            matched_count += matched_rows_md.len();
             report.push_str(&format!(
-                "#### 🔍 Matching Rows for Your Query (`{}` found)\n",
-                matched_count
+                "#### 🔍 Matching Rows in Current Grid (`{}` found)\n",
+                matched_rows_md.len()
             ));
             for m in matched_rows_md {
                 report.push_str(&format!("{m}\n"));
             }
+            report.push('\n');
         }
     } else {
-        report.push_str("### 🌐 Workspace Overview\n");
+        report.push_str("### 🌐 PyraOcean Workspace Overview\n");
         report.push_str(&format!(
             "- **Accessible Grids:** `{}`\n",
             accessible_grids.len()
         ));
-        for (_gid, _sid, sname, gname) in accessible_grids.iter().take(15) {
-            report.push_str(&format!("- **{}** → `{}`\n", sname, gname));
+        for (_gid, _sid, sname, gname, gicon) in accessible_grids.iter().take(15) {
+            report.push_str(&format!(
+                "- **{}** → {} `{}`\n",
+                sname,
+                gicon.as_deref().unwrap_or("📄"),
+                gname
+            ));
+        }
+        report.push('\n');
+    }
+
+    // Cross-Space Global Search across ALL other accessible Spaces & Grids
+    if !keywords.is_empty() {
+        let mut cross_space_md: Vec<String> = Vec::new();
+        let active_gid = active_grid.as_ref().map(|g| g.id);
+
+        // Also match Grid/Space titles directly
+        for (gid, sid, sname, gtitle, gicon) in accessible_grids {
+            let combined_title = format!("{} {}", sname, gtitle).to_ascii_lowercase();
+            if keywords.iter().any(|kw| combined_title.contains(kw)) {
+                if navigation_targets.len() < 15
+                    && !navigation_targets
+                        .iter()
+                        .any(|t| t.grid_id == *gid && t.row_id.is_none())
+                {
+                    let rcount = grid_rows_map.get(gid).map(|v| v.len()).unwrap_or(0);
+                    navigation_targets.push(AiNavigationTarget {
+                        space_id: *sid,
+                        space_name: sname.clone(),
+                        grid_id: *gid,
+                        grid_name: gtitle.clone(),
+                        grid_icon: gicon.clone(),
+                        row_id: None,
+                        row_number: None,
+                        primary_label: format!("{} / {}", sname, gtitle),
+                        matched_preview: format!("Grid in Space '{}' ({} rows)", sname, rcount),
+                    });
+                }
+            }
+
+            if Some(*gid) == active_gid {
+                continue;
+            }
+            let Some(other_cols) = grid_columns_map.get(gid) else {
+                continue;
+            };
+            let Some(other_rows) = grid_rows_map.get(gid) else {
+                continue;
+            };
+
+            for (r_idx, r) in other_rows.iter().enumerate() {
+                let mut pairs: Vec<String> = Vec::new();
+                for col in other_cols.iter().filter(|c| !c.is_hidden) {
+                    let text = resolve_row_cell_display(
+                        col,
+                        r.cells.get(&col.id),
+                        user_display_map,
+                        r.last_modified,
+                    )
+                    .replace(['\t', '\n', '\r'], " ");
+                    let clean = text.trim();
+                    if !clean.is_empty() {
+                        pairs.push(format!("{}: {}", col.name, clean));
+                    }
+                }
+                let row_line = pairs.join(" | ");
+                let lower_line = row_line.to_ascii_lowercase();
+                if keywords.iter().any(|kw| lower_line.contains(kw)) {
+                    let (prim_label, preview_str) =
+                        summarize_row_for_navigation(other_cols, r, r_idx + 1, user_display_map);
+                    if navigation_targets.len() < 15 {
+                        navigation_targets.push(AiNavigationTarget {
+                            space_id: *sid,
+                            space_name: sname.clone(),
+                            grid_id: *gid,
+                            grid_name: gtitle.clone(),
+                            grid_icon: gicon.clone(),
+                            row_id: Some(r.id),
+                            row_number: Some(r_idx + 1),
+                            primary_label: prim_label,
+                            matched_preview: preview_str,
+                        });
+                    }
+                    if cross_space_md.len() < 35 {
+                        cross_space_md.push(format!(
+                            "- **[{} / {} — Row #{}]** {}",
+                            sname,
+                            gtitle,
+                            r_idx + 1,
+                            row_line
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !cross_space_md.is_empty() {
+            matched_count += cross_space_md.len();
+            ctx.push_str("\nCross-Space Matches Found Across Other Spaces & Grids:\n");
+            report.push_str(&format!(
+                "#### 🧭 Cross-Space Matches Across Other Spaces & Grids (`{}` found)\n",
+                cross_space_md.len()
+            ));
+            for line in cross_space_md {
+                ctx.push_str(&line);
+                ctx.push('\n');
+                report.push_str(&line);
+                report.push('\n');
+            }
+            report.push('\n');
         }
     }
 
-    (ctx, report, matched_count)
+    (ctx, report, matched_count, navigation_targets)
 }
 
 fn parse_llm_command_envelope(raw: &str) -> Option<LLMCommandEnvelope> {
     let trimmed = raw.trim();
+
+    // 1. Direct envelope {"explanation": ..., "actions": [...]}
     if let Ok(env) = serde_json::from_str::<LLMCommandEnvelope>(trimmed) {
         if !env.actions.is_empty() || env.explanation.is_some() {
             return Some(env);
         }
     }
+
+    // 2. Direct JSON array [{"action": ...}, {"action": ...}]
+    if let Ok(arr) = serde_json::from_str::<Vec<LLMTaskSpec>>(trimmed) {
+        if !arr.is_empty() {
+            return Some(LLMCommandEnvelope {
+                explanation: Some(format!("Executed {} requested task(s).", arr.len())),
+                actions: arr,
+            });
+        }
+    }
+
+    // 3. Extract from ```json_actions ... ``` or ```json ... ``` fenced blocks (supports multiple blocks)
+    let mut collected_actions: Vec<LLMTaskSpec> = Vec::new();
+    let mut explanation: Option<String> = None;
+    let mut search_slice = trimmed;
+    while let Some(fence_start) = search_slice.find("```") {
+        let after_ticks = &search_slice[fence_start + 3..];
+        let body_start = after_ticks.find('\n').map(|i| i + 1).unwrap_or(0);
+        let after_header = &after_ticks[body_start..];
+        if let Some(fence_end) = after_header.find("```") {
+            let block = after_header[..fence_end].trim();
+            if let Ok(env) = serde_json::from_str::<LLMCommandEnvelope>(block) {
+                if explanation.is_none() {
+                    explanation = env.explanation;
+                }
+                collected_actions.extend(env.actions);
+            } else if let Ok(arr) = serde_json::from_str::<Vec<LLMTaskSpec>>(block) {
+                collected_actions.extend(arr);
+            } else if let Ok(single) = serde_json::from_str::<LLMTaskSpec>(block) {
+                collected_actions.push(single);
+            }
+            search_slice = &after_header[fence_end + 3..];
+        } else {
+            break;
+        }
+    }
+    if !collected_actions.is_empty() {
+        return Some(LLMCommandEnvelope {
+            explanation: Some(explanation.unwrap_or_else(|| {
+                format!("Executed {} requested task(s).", collected_actions.len())
+            })),
+            actions: collected_actions,
+        });
+    }
+
+    // 4. Try array slice [...] if present
+    if let (Some(a_start), Some(a_end)) = (trimmed.find('['), trimmed.rfind(']')) {
+        if a_end > a_start {
+            let arr_slice = &trimmed[a_start..=a_end];
+            if let Ok(arr) = serde_json::from_str::<Vec<LLMTaskSpec>>(arr_slice) {
+                if !arr.is_empty() {
+                    return Some(LLMCommandEnvelope {
+                        explanation: Some(format!("Executed {} requested task(s).", arr.len())),
+                        actions: arr,
+                    });
+                }
+            }
+        }
+    }
+
+    // 5. Try object slice {...} or multiple newline-separated JSON objects
+    for line in trimmed.lines() {
+        let l = line.trim().trim_end_matches(',');
+        if l.starts_with('{') && l.ends_with('}') {
+            if let Ok(single) = serde_json::from_str::<LLMTaskSpec>(l) {
+                collected_actions.push(single);
+            }
+        }
+    }
+    if !collected_actions.is_empty() {
+        return Some(LLMCommandEnvelope {
+            explanation: Some(format!(
+                "Executed {} requested task(s).",
+                collected_actions.len()
+            )),
+            actions: collected_actions,
+        });
+    }
+
     if let Some(start) = trimmed.find('{') {
         if let Some(end) = trimmed.rfind('}') {
             if end > start {
@@ -2358,24 +3099,242 @@ fn parse_llm_command_envelope(raw: &str) -> Option<LLMCommandEnvelope> {
     None
 }
 
-fn prompt_is_explicit_task_command(prompt: &str) -> bool {
-    let lower = prompt.trim().to_ascii_lowercase();
+fn strip_polite_prefix(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        let lower = cur.to_ascii_lowercase();
+        if let Some( idx ) = ["please ", "can you ", "could you ", "kindly "]
+            .iter()
+            .find_map(|p| if lower.starts_with(p) { Some(p.len()) } else { None })
+        {
+            cur = cur[idx..].trim();
+        } else {
+            break;
+        }
+    }
+    cur
+}
+
+fn starts_with_action_verb(s: &str) -> bool {
+    let clean = strip_polite_prefix(s);
+    let lower = clean.to_ascii_lowercase();
     lower.starts_with("create grid")
         || lower.starts_with("create a grid")
         || lower.starts_with("new grid")
         || lower.starts_with("add column")
+        || lower.starts_with("add columns")
         || lower.starts_with("create column")
+        || lower.starts_with("create columns")
         || lower.starts_with("new column")
+        || lower.starts_with("new columns")
+        || lower.starts_with("rename column")
+        || lower.starts_with("edit column")
+        || lower.starts_with("delete column")
+        || lower.starts_with("delete columns")
+        || lower.starts_with("remove column")
+        || lower.starts_with("remove columns")
+        || lower.starts_with("drop column")
+        || lower.starts_with("drop columns")
         || lower.starts_with("add row")
         || lower.starts_with("add a row")
         || lower.starts_with("insert row")
+        || lower.starts_with("create row")
+        || lower.starts_with("new row")
         || lower.starts_with("update row")
         || lower.starts_with("edit row")
+        || lower.starts_with("modify row")
         || lower.starts_with("delete row")
         || lower.starts_with("remove row")
         || lower.starts_with("add tag ")
         || lower.starts_with("remove tag ")
+        || lower.starts_with("go to ")
+        || lower.starts_with("open ")
+        || lower.starts_with("navigate to ")
+        || lower.starts_with("take me to ")
+        || lower.starts_with("jump to ")
+        || lower.starts_with("switch to ")
         || (lower.starts_with("set ") && (lower.contains(" for ") || lower.contains(" on ")))
+}
+
+fn prompt_is_explicit_task_command(prompt: &str) -> bool {
+    starts_with_action_verb(prompt)
+}
+
+/// Splits a multi-task user prompt into individual atomic command strings whenever action verbs
+/// are separated by `,`, `;`, `\n`, or conjunctions (`and`, `then`, `also`), and expands
+/// multi-column lists like `"add column username, Size, Department"` into separate tasks,
+/// while preserving comma-separated key-value pairs inside `add row` / `update row`.
+fn split_into_atomic_tasks(prompt: &str) -> Vec<String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let len = bytes.len();
+
+    let mut raw_clauses: Vec<String> = Vec::new();
+    let mut clause_start = 0usize;
+    let mut i = 0usize;
+
+    while i < len {
+        // Check for delimiter at position `i`: `,`, `;`, `\n`, or word conjunction `" and "`, `" then "`, `" also "`
+        let mut delim_end: Option<usize> = None;
+
+        if matches!(bytes[i], b',' | b';' | b'\n') {
+            delim_end = Some(i + 1);
+        } else if bytes[i].is_ascii_whitespace() {
+            let rem = &lower[i..];
+            for conj in [" and ", " then ", " also "] {
+                if rem.starts_with(conj) {
+                    delim_end = Some(i + conj.len());
+                    break;
+                }
+            }
+        }
+
+        if let Some(mut after_delim) = delim_end {
+            // Skip any whitespace and optional chained conjunctions (e.g. `, and then add column ...`)
+            while after_delim < len && bytes[after_delim].is_ascii_whitespace() {
+                after_delim += 1;
+            }
+            loop {
+                let rem = &lower[after_delim..];
+                let mut stripped_conj = false;
+                for conj in ["and ", "then ", "also "] {
+                    if rem.starts_with(conj) {
+                        after_delim += conj.len();
+                        while after_delim < len && bytes[after_delim].is_ascii_whitespace() {
+                            after_delim += 1;
+                        }
+                        stripped_conj = true;
+                        break;
+                    }
+                }
+                if !stripped_conj {
+                    break;
+                }
+            }
+
+            if after_delim < len && trimmed.is_char_boundary(i) && trimmed.is_char_boundary(after_delim) {
+                let rest = &trimmed[after_delim..];
+                if starts_with_action_verb(rest) {
+                    let prev_clause = trimmed[clause_start..i].trim();
+                    if !prev_clause.is_empty() {
+                        raw_clauses.push(prev_clause.to_string());
+                    }
+                    clause_start = after_delim;
+                    i = after_delim;
+                    continue;
+                }
+            }
+        }
+
+        // Advance `i` to the next UTF-8 char boundary
+        i += 1;
+        while i < len && !trimmed.is_char_boundary(i) {
+            i += 1;
+        }
+    }
+
+    if clause_start < len {
+        let tail = trimmed[clause_start..].trim();
+        if !tail.is_empty() {
+            raw_clauses.push(tail.to_string());
+        }
+    }
+
+    // Pass 2: Expand multi-column `add column A, B, C` or `delete column A, B` clauses into atomic tasks
+    let mut atomic_tasks: Vec<String> = Vec::new();
+    for clause in raw_clauses {
+        let clean_clause = strip_polite_prefix(&clause);
+        let cl_lower = clean_clause.to_ascii_lowercase();
+
+        let is_add_col = cl_lower.starts_with("add column")
+            || cl_lower.starts_with("add columns")
+            || cl_lower.starts_with("create column")
+            || cl_lower.starts_with("create columns")
+            || cl_lower.starts_with("new column")
+            || cl_lower.starts_with("new columns");
+
+        let is_del_col = cl_lower.starts_with("delete column")
+            || cl_lower.starts_with("delete columns")
+            || cl_lower.starts_with("remove column")
+            || cl_lower.starts_with("remove columns")
+            || cl_lower.starts_with("drop column")
+            || cl_lower.starts_with("drop columns");
+
+        if is_add_col || is_del_col {
+            // Find where the word "columns" or "column" ends
+            let after_kw = if let Some(pos) = cl_lower.find("columns") {
+                &clean_clause[pos + "columns".len()..]
+            } else if let Some(pos) = cl_lower.find("column") {
+                &clean_clause[pos + "column".len()..]
+            } else {
+                ""
+            };
+            let after_kw = after_kw
+                .trim()
+                .trim_start_matches(['=', ':'])
+                .trim()
+                .trim_start_matches("called ")
+                .trim_start_matches("named ")
+                .trim();
+
+            // Split multiple column names separated by `,` or `" and "`
+            let mut sub_names: Vec<String> = Vec::new();
+            for comma_part in after_kw.split(',') {
+                let cp = comma_part.trim();
+                if cp.is_empty() {
+                    continue;
+                }
+                // Also split on case-insensitive " and "
+                let cp_lower = cp.to_ascii_lowercase();
+                if cp_lower.contains(" and ") {
+                    let mut start_idx = 0usize;
+                    while let Some(rel_idx) = cp_lower[start_idx..].find(" and ") {
+                        let abs_idx = start_idx + rel_idx;
+                        let piece = cp[start_idx..abs_idx].trim();
+                        if !piece.is_empty() {
+                            sub_names.push(piece.to_string());
+                        }
+                        start_idx = abs_idx + 5;
+                    }
+                    let rem_piece = cp[start_idx..].trim();
+                    if !rem_piece.is_empty() {
+                        sub_names.push(rem_piece.to_string());
+                    }
+                } else {
+                    sub_names.push(cp.to_string());
+                }
+            }
+
+            if sub_names.len() > 1 {
+                let verb = if is_del_col {
+                    "delete column"
+                } else {
+                    "add column"
+                };
+                for sub in sub_names {
+                    let clean_sub = sub
+                        .trim()
+                        .trim_start_matches("column ")
+                        .trim_start_matches("columns ")
+                        .trim_start_matches(['=', ':'])
+                        .trim();
+                    if !clean_sub.is_empty() {
+                        atomic_tasks.push(format!("{verb} {clean_sub}"));
+                    }
+                }
+                continue;
+            }
+        }
+
+        atomic_tasks.push(clean_clause.to_string());
+    }
+
+    atomic_tasks
 }
 
 /// Multi-tag-aware key-value parser that parses `Service = Canva, Department = Marketing, B2C, Payment = Yearly`
@@ -2472,13 +3431,121 @@ fn parse_key_value_pairs_from_prompt(
     values
 }
 
-fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCommandEnvelope {
-    let lower = prompt.trim().to_ascii_lowercase();
+fn extract_column_name_and_type(raw_after_col: &str) -> (String, String) {
+    let mut cleaned = raw_after_col
+        .trim()
+        .trim_start_matches("s ")
+        .trim()
+        .trim_start_matches(['=', ':'])
+        .trim()
+        .trim_start_matches("called ")
+        .trim_start_matches("named ")
+        .trim()
+        .trim_start_matches(['=', ':'])
+        .trim()
+        .trim_matches(['"', '\'', ',', '.'])
+        .trim()
+        .to_string();
+
+    let mut explicit_type: Option<&str> = None;
+    let lower_cleaned = cleaned.to_ascii_lowercase();
+
+    // Check trailing parenthesized or keyword type specifier like `Size (number)` or `Size as number` or `Size type select`
+    for (kw, mapped) in [
+        ("multi_select", "multi_select"),
+        ("multiselect", "multi_select"),
+        ("currency", "currency"),
+        ("number", "number"),
+        ("select", "select"),
+        ("checkbox", "checkbox"),
+        ("checklist", "checklist"),
+        ("person", "person"),
+        ("password", "password"),
+        ("date", "date"),
+        ("text", "text"),
+    ] {
+        for suffix_pat in [
+            format!("({kw})"),
+            format!(" as {kw}"),
+            format!(" type {kw}"),
+            format!(" : {kw}"),
+            format!(": {kw}"),
+        ] {
+            if lower_cleaned.ends_with(&suffix_pat) {
+                let keep_len = cleaned.len().saturating_sub(suffix_pat.len());
+                cleaned = cleaned[..keep_len]
+                    .trim()
+                    .trim_matches(['"', '\'', ',', '.'])
+                    .trim()
+                    .to_string();
+                explicit_type = Some(mapped);
+                break;
+            }
+        }
+        if explicit_type.is_some() {
+            break;
+        }
+    }
+
+    let ptype = if let Some(t) = explicit_type {
+        t
+    } else {
+        let lc = cleaned.to_ascii_lowercase();
+        if lc == "tags" || lc == "departments" || lc == "categories" {
+            "multi_select"
+        } else if lc == "cost" || lc == "budget" || lc == "price" || lc == "amount" {
+            "currency"
+        } else if lc == "status" || lc == "priority" {
+            "select"
+        } else if lc == "date" || lc == "deadline" || lc == "due date" {
+            "date"
+        } else {
+            "text"
+        }
+    };
+
+    if cleaned.is_empty() {
+        cleaned = "New Column".to_string();
+    }
+
+    (cleaned, ptype.to_string())
+}
+
+fn parse_single_atomic_task(
+    clause: &str,
+    simulated_columns: &mut Vec<GridColumn>,
+) -> Option<LLMTaskSpec> {
+    let prompt = strip_polite_prefix(clause);
+    let lower = prompt.to_ascii_lowercase();
+
+    // 0. Direct Navigation intent (`go to ...`, `open ...`, `navigate to ...`, `take me to ...`)
+    for nav_prefix in [
+        "navigate to ",
+        "take me to ",
+        "switch to ",
+        "jump to ",
+        "go to ",
+        "open ",
+    ] {
+        if lower.starts_with(nav_prefix) {
+            let target = prompt[nav_prefix.len()..]
+                .trim()
+                .trim_start_matches("grid ")
+                .trim_start_matches("space ")
+                .trim_start_matches("row ")
+                .trim_matches(['"', '\'', '.', ':'])
+                .trim()
+                .to_string();
+            if !target.is_empty() {
+                return Some(LLMTaskSpec::Navigate { target });
+            }
+        }
+    }
 
     // 1. Create Grid intent (`create grid ...` or `new grid ...`)
-    if lower.contains("create grid")
-        || lower.contains("create a grid")
-        || lower.contains("new grid")
+    if lower.starts_with("create grid")
+        || lower.starts_with("create a grid")
+        || lower.starts_with("new grid")
     {
         let name = prompt
             .split_once("called")
@@ -2490,110 +3557,154 @@ fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCom
                     .next()
                     .unwrap_or("")
                     .trim()
+                    .trim_start_matches(['=', ':'])
+                    .trim()
                     .trim_matches(['"', '\'', ':'])
                     .to_string()
             })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "AI Workspace Grid".to_string());
 
-        return LLMCommandEnvelope {
-            explanation: Some(format!("Created new grid '{name}' via PyraAI.")),
-            actions: vec![LLMTaskSpec::CreateGrid {
-                name,
-                icon: Some("✨".into()),
-                columns: vec![
-                    LLMColumnSpec {
-                        name: "Name".into(),
-                        property_type: "text".into(),
-                    },
-                    LLMColumnSpec {
-                        name: "Status".into(),
-                        property_type: "select".into(),
-                    },
-                    LLMColumnSpec {
-                        name: "Budget".into(),
-                        property_type: "currency".into(),
-                    },
-                ],
-                rows: Vec::new(),
-            }],
-        };
+        return Some(LLMTaskSpec::CreateGrid {
+            name,
+            icon: Some("✨".into()),
+            columns: vec![
+                LLMColumnSpec {
+                    name: "Name".into(),
+                    property_type: "text".into(),
+                },
+                LLMColumnSpec {
+                    name: "Status".into(),
+                    property_type: "select".into(),
+                },
+                LLMColumnSpec {
+                    name: "Budget".into(),
+                    property_type: "currency".into(),
+                },
+            ],
+            rows: Vec::new(),
+        });
     }
 
-    // 2. Add Column intent (`add column ...`)
-    if lower.contains("add column") || lower.contains("create column") || lower.contains("new column") {
-        let col_name = prompt
-            .split_once("column")
-            .map(|(_, r)| {
-                r.trim()
-                    .trim_start_matches("called ")
-                    .trim_start_matches("named ")
-                    .split_whitespace()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+    // 2. Rename Column intent (`rename column A to B` or `edit column A to B`)
+    if lower.starts_with("rename column") || lower.starts_with("edit column") {
+        if let Some((_, after_col)) = prompt.split_once("column") {
+            let trimmed = after_col
+                .trim()
+                .trim_start_matches(['=', ':'])
+                .trim();
+            let split_res = if let Some(idx) = trimmed.to_ascii_lowercase().rfind(" to ") {
+                Some((&trimmed[..idx], &trimmed[idx + 4..]))
+            } else {
+                trimmed.split_once('=').or_else(|| trimmed.split_once(':'))
+            };
+            if let Some((old_raw, new_raw)) = split_res {
+                let old_name = old_raw
+                    .trim()
                     .trim_matches(['"', '\'', ',', '.'])
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "New Column".to_string());
-
-        let ptype = if lower.contains("multi_select")
-            || lower.contains("multiselect")
-            || lower.contains("multiple")
-            || lower.contains("tags")
-        {
-            "multi_select"
-        } else if lower.contains("currency") || lower.contains("cost") || lower.contains("budget") {
-            "currency"
-        } else if lower.contains("number") {
-            "number"
-        } else if lower.contains("select") || lower.contains("status") {
-            "select"
-        } else if lower.contains("date") {
-            "date"
-        } else if lower.contains("checkbox") {
-            "checkbox"
-        } else {
-            "text"
-        };
-
-        return LLMCommandEnvelope {
-            explanation: Some(format!("Added column '{col_name}' ({ptype}).")),
-            actions: vec![LLMTaskSpec::AddColumn {
-                name: col_name,
-                property_type: ptype.to_string(),
-            }],
-        };
+                    .trim()
+                    .to_string();
+                let new_name = new_raw
+                    .trim()
+                    .trim_start_matches(['=', ':'])
+                    .trim()
+                    .trim_matches(['"', '\'', ',', '.'])
+                    .trim()
+                    .to_string();
+                if !old_name.is_empty() && !new_name.is_empty() {
+                    if let Some(col) = simulated_columns
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(&old_name))
+                    {
+                        col.name = new_name.clone();
+                    }
+                    return Some(LLMTaskSpec::RenameColumn { old_name, new_name });
+                }
+            }
+        }
     }
 
-    // 3. Delete Row intent (`delete row ...` or `remove row ...`)
-    if lower.contains("delete row") || lower.contains("remove row") {
+    // 3. Delete Column intent (`delete column D`, `remove column D`, `drop column D`)
+    if lower.starts_with("delete column")
+        || lower.starts_with("remove column")
+        || lower.starts_with("drop column")
+    {
+        if let Some((_, after_col)) = prompt.split_once("column") {
+            let col_name = after_col
+                .trim()
+                .trim_start_matches("s ")
+                .trim()
+                .trim_start_matches(['=', ':'])
+                .trim()
+                .trim_start_matches("called ")
+                .trim_start_matches("named ")
+                .trim()
+                .trim_matches(['"', '\'', ',', '.'])
+                .trim()
+                .to_string();
+            if !col_name.is_empty() {
+                simulated_columns.retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
+                return Some(LLMTaskSpec::DeleteColumn { name: col_name });
+            }
+        }
+    }
+
+    // 4. Add Column intent (`add column = username`, `add column Size`, `create column ...`)
+    if lower.starts_with("add column")
+        || lower.starts_with("create column")
+        || lower.starts_with("new column")
+    {
+        let raw_after = prompt
+            .split_once("columns")
+            .or_else(|| prompt.split_once("column"))
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        let (col_name, ptype) = extract_column_name_and_type(raw_after);
+        let (parsed_ptype, parsed_cfg) = parse_property_type_and_config(&ptype);
+
+        // Add simulated column in memory so subsequent `add row` / `update row` tasks in the same prompt recognize it!
+        simulated_columns.push(GridColumn {
+            id: Uuid::new_v4(),
+            grid_id: Uuid::nil(),
+            name: col_name.clone(),
+            property_type: parsed_ptype,
+            property_config: parsed_cfg,
+            width_px: 200,
+            position: simulated_columns.len() as i32,
+            is_primary: false,
+            is_hidden: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+
+        return Some(LLMTaskSpec::AddColumn {
+            name: col_name,
+            property_type: ptype,
+        });
+    }
+
+    // 5. Delete Row intent (`delete row ...` or `remove row ...`)
+    if lower.starts_with("delete row") || lower.starts_with("remove row") {
         let match_text = prompt
             .split_once("row")
             .map(|(_, r)| {
                 r.trim()
                     .trim_start_matches("where ")
                     .trim_start_matches("matching ")
+                    .trim_start_matches(['=', ':'])
+                    .trim()
                     .trim_matches(['"', '\'', '.'])
                     .to_string()
             })
             .unwrap_or_default();
 
-        return LLMCommandEnvelope {
-            explanation: Some(format!("Deleted row(s) matching '{match_text}'.")),
-            actions: vec![LLMTaskSpec::DeleteRow { match_text }],
-        };
+        return Some(LLMTaskSpec::DeleteRow { match_text });
     }
 
-    // 4. Add/Remove Single or Multiple Tags on MultiSelect (`add tag 'B2C' to ChatGPT`, `remove tag 'B2C' from ChatGPT`)
+    // 6. Add/Remove Single or Multiple Tags on MultiSelect (`add tag 'B2C' to ChatGPT`, `remove tag 'B2C' from ChatGPT`)
     if lower.starts_with("add tag ") || lower.starts_with("remove tag ") {
         let is_remove = lower.starts_with("remove tag ");
-        let body = if is_remove {
-            &prompt.trim()[11..]
-        } else {
-            &prompt.trim()[8..]
-        };
+        let body = if is_remove { &prompt[11..] } else { &prompt[8..] };
         let split_pos = if is_remove {
             body.to_ascii_lowercase().rfind(" from ")
         } else {
@@ -2607,39 +3718,31 @@ fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCom
                 .trim_matches(['"', '\'', '.'])
                 .to_string();
 
-            let multi_col = active_columns
+            let multi_col = simulated_columns
                 .iter()
                 .find(|c| c.property_type == ColumnPropertyType::MultiSelect)
                 .or_else(|| {
-                    active_columns
+                    simulated_columns
                         .iter()
                         .find(|c| c.property_type == ColumnPropertyType::Select)
                 });
 
             if let Some(col) = multi_col {
                 let mut values = HashMap::new();
-                values.insert(col.name.clone(), Value::String(tag_str.clone()));
-                return LLMCommandEnvelope {
-                    explanation: Some(format!(
-                        "{} tag '{}' on '{}'",
-                        if is_remove { "Removed" } else { "Added" },
-                        tag_str,
-                        target_row_str
-                    )),
-                    actions: vec![LLMTaskSpec::UpdateRow {
-                        match_text: target_row_str,
-                        values,
-                        append_tags: !is_remove,
-                        remove_tags: is_remove,
-                    }],
-                };
+                values.insert(col.name.clone(), Value::String(tag_str));
+                return Some(LLMTaskSpec::UpdateRow {
+                    match_text: target_row_str,
+                    values,
+                    append_tags: !is_remove,
+                    remove_tags: is_remove,
+                });
             }
         }
     }
 
-    // 5. Natural `Set <Column> to <Val1, Val2> for <Row>` (`Set Department to Software and Innovation for row 1`)
+    // 7. Natural `Set <Column> to <Val1, Val2> for <Row>` (`Set Department to Software and Innovation for row 1`)
     if lower.starts_with("set ") && (lower.contains(" for ") || lower.contains(" on ")) {
-        let body = &prompt.trim()[4..];
+        let body = &prompt[4..];
         let split_kw = if body.to_ascii_lowercase().contains(" for ") {
             " for "
         } else {
@@ -2656,29 +3759,28 @@ fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCom
                 let col_part = assignment_part[..to_idx].trim();
                 let val_part = assignment_part[to_idx + 4..].trim();
                 let synthetic = format!("{col_part} = {val_part}");
-                let values = parse_key_value_pairs_from_prompt(&synthetic, active_columns);
+                let values = parse_key_value_pairs_from_prompt(&synthetic, simulated_columns);
                 if !values.is_empty() {
-                    return LLMCommandEnvelope {
-                        explanation: Some(format!("Updated '{target_row_str}' via PyraAI.")),
-                        actions: vec![LLMTaskSpec::UpdateRow {
-                            match_text: target_row_str,
-                            values,
-                            append_tags: false,
-                            remove_tags: false,
-                        }],
-                    };
+                    return Some(LLMTaskSpec::UpdateRow {
+                        match_text: target_row_str,
+                        values,
+                        append_tags: false,
+                        remove_tags: false,
+                    });
                 }
             }
         }
     }
 
-    // 6. Update Row intent (`update row 3 Department = Software, Innovation` or `edit row ChatGPT Payment = Yearly`)
-    if lower.contains("update row") || lower.contains("edit row") {
+    // 8. Update Row intent (`update row 3 Department = Software, Innovation` or `edit row ChatGPT Payment = Yearly`)
+    if lower.starts_with("update row")
+        || lower.starts_with("edit row")
+        || lower.starts_with("modify row")
+    {
         let after_row = prompt
             .split_once("row")
             .map(|(_, r)| r.trim())
             .unwrap_or("");
-        // Extract the row identifier before the first column name + `=`/`:`
         let mut match_text = String::new();
         let mut kv_start_slice = after_row;
 
@@ -2686,14 +3788,13 @@ fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCom
             let before_eq = after_row[..eq_idx].trim();
             let words: Vec<&str> = before_eq.split_whitespace().collect();
             if words.len() >= 2 {
-                // Check if the last 1 or 2 words match a column name
                 let last_two = if words.len() >= 3 {
                     format!("{} {}", words[words.len() - 2], words[words.len() - 1])
                 } else {
                     String::new()
                 };
                 let two_word_col = !last_two.is_empty()
-                    && active_columns
+                    && simulated_columns
                         .iter()
                         .any(|c| c.name.eq_ignore_ascii_case(&last_two));
                 let col_word_count = if two_word_col { 2 } else { 1 };
@@ -2706,57 +3807,88 @@ fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCom
                 let col_part = words[words.len() - col_word_count..].join(" ");
                 let after_eq = &after_row[eq_idx..];
                 let rebuilt = format!("{col_part}{after_eq}");
-                let values = parse_key_value_pairs_from_prompt(&rebuilt, active_columns);
-                return LLMCommandEnvelope {
-                    explanation: Some(format!("Updated row '{match_text}' via PyraAI.")),
-                    actions: vec![LLMTaskSpec::UpdateRow {
-                        match_text,
-                        values,
-                        append_tags: false,
-                        remove_tags: false,
-                    }],
-                };
+                let values = parse_key_value_pairs_from_prompt(&rebuilt, simulated_columns);
+                return Some(LLMTaskSpec::UpdateRow {
+                    match_text,
+                    values,
+                    append_tags: false,
+                    remove_tags: false,
+                });
             }
         } else {
             kv_start_slice = after_row;
         }
 
-        let values = parse_key_value_pairs_from_prompt(kv_start_slice, active_columns);
-        return LLMCommandEnvelope {
-            explanation: Some(format!("Updated row '{match_text}' via PyraAI.")),
-            actions: vec![LLMTaskSpec::UpdateRow {
-                match_text,
-                values,
-                append_tags: false,
-                remove_tags: false,
-            }],
-        };
+        let values = parse_key_value_pairs_from_prompt(kv_start_slice, simulated_columns);
+        return Some(LLMTaskSpec::UpdateRow {
+            match_text,
+            values,
+            append_tags: false,
+            remove_tags: false,
+        });
     }
 
-    // 7. Add Row intent (`add row Service = Canva, Department = Marketing, B2C, Payment = Yearly`)
-    if lower.contains("add row") || lower.contains("add a row") || lower.contains("insert row") {
-        let values = parse_key_value_pairs_from_prompt(prompt, active_columns);
+    // 9. Add Row intent (`add row Service = Canva, Department = Marketing, B2C, Payment = Yearly`)
+    if lower.starts_with("add row")
+        || lower.starts_with("add a row")
+        || lower.starts_with("insert row")
+        || lower.starts_with("create row")
+        || lower.starts_with("new row")
+    {
+        let values = parse_key_value_pairs_from_prompt(prompt, simulated_columns);
         let mut final_values = values;
         if final_values.is_empty() {
-            if let Some(first_col) = active_columns.first() {
+            if let Some(first_col) = simulated_columns.first() {
                 let fallback_text = prompt
                     .split_once("row")
-                    .map(|(_, r)| r.trim().trim_matches(['"', '\'', ':']).to_string())
+                    .map(|(_, r)| {
+                        r.trim()
+                            .trim_start_matches(['=', ':'])
+                            .trim()
+                            .trim_matches(['"', '\'', ':'])
+                            .to_string()
+                    })
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "New AI Row".to_string());
                 final_values.insert(first_col.name.clone(), Value::String(fallback_text));
             }
         }
-        return LLMCommandEnvelope {
-            explanation: Some("Inserted new row via PyraAI.".into()),
-            actions: vec![LLMTaskSpec::AddRow {
-                values: final_values,
-            }],
-        };
+        return Some(LLMTaskSpec::AddRow {
+            values: final_values,
+        });
     }
 
-    LLMCommandEnvelope {
-        explanation: None,
-        actions: Vec::new(),
+    None
+}
+
+fn fallback_intent_parser(prompt: &str, active_columns: &[GridColumn]) -> LLMCommandEnvelope {
+    let atomic_clauses = split_into_atomic_tasks(prompt);
+    let mut simulated_columns: Vec<GridColumn> = active_columns.to_vec();
+    let mut actions: Vec<LLMTaskSpec> = Vec::new();
+
+    for clause in &atomic_clauses {
+        if let Some(spec) = parse_single_atomic_task(clause, &mut simulated_columns) {
+            actions.push(spec);
+        }
+    }
+
+    if actions.is_empty() {
+        LLMCommandEnvelope {
+            explanation: None,
+            actions: Vec::new(),
+        }
+    } else {
+        let explanation = if actions.len() == 1 {
+            "Completed 1 requested workspace task via PyraAI.".to_string()
+        } else {
+            format!(
+                "Completed all {} requested workspace tasks in sequence via PyraAI:",
+                actions.len()
+            )
+        };
+        LLMCommandEnvelope {
+            explanation: Some(explanation),
+            actions,
+        }
     }
 }

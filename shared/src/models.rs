@@ -768,17 +768,37 @@ pub struct AiAttachment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiNavigationTarget {
+    pub space_id: Uuid,
+    pub space_name: String,
+    pub grid_id: Uuid,
+    pub grid_name: String,
+    #[serde(default)]
+    pub grid_icon: Option<String>,
+    #[serde(default)]
+    pub row_id: Option<Uuid>,
+    #[serde(default)]
+    pub row_number: Option<usize>,
+    pub primary_label: String,
+    pub matched_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiChatMessage {
     pub role: String,
     pub content: String,
     #[serde(default)]
     pub attachments: Vec<AiAttachment>,
+    #[serde(default)]
+    pub navigation_targets: Vec<AiNavigationTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiExecutedAction {
     pub action_type: String,
     pub summary: String,
+    #[serde(default)]
+    pub space_id: Option<Uuid>,
     #[serde(default)]
     pub grid_id: Option<Uuid>,
     #[serde(default)]
@@ -813,7 +833,13 @@ pub struct AiCopilotResponse {
     #[serde(default)]
     pub matched_rows_count: usize,
     #[serde(default)]
+    pub navigated_space_id: Option<Uuid>,
+    #[serde(default)]
     pub navigated_grid_id: Option<Uuid>,
+    #[serde(default)]
+    pub navigated_row_id: Option<Uuid>,
+    #[serde(default)]
+    pub navigation_targets: Vec<AiNavigationTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2461,7 +2487,7 @@ pub fn generate_grid_a3_pdf_html_with_options(
     <div style="display:flex;align-items:center;gap:12px;">
       <img src="/public/logo-light.png" alt="PyraOcean" style="height:40px;width:40px;object-fit:contain;border-radius:8px;border:1px solid #cbd5e1;" />
       <div>
-        <div class="brand-title">Pyra<span class="accent">Ocean</span> — "#,
+        <div class="brand-title">PyraOcean — "#,
     );
     html.push_str(&escape_html(grid_title));
     html.push_str(

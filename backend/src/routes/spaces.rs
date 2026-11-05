@@ -15,16 +15,34 @@ use serde_json::json;
 use uuid::Uuid;
 
 // ============================================================================
-// 1. Super Admin Space Lifecycle Endpoints (`RequireSuperAdmin`)
+// 1. Space Lifecycle Endpoints (`SuperAdmin` & `Admin`)
 // ============================================================================
 
 /// `POST /api/spaces`
-/// Creates a new top-level Workspace (Space) and assigns one or more `Admin` managers to it.
+/// Creates a new top-level Workspace (Space) and assigns the creator (and any requested `Admin` managers) as `SpaceAdmin`.
 pub async fn create_space(
     State(state): State<AppState>,
-    RequireSuperAdmin(super_admin): RequireSuperAdmin,
+    RequireSpaceAccess(actor): RequireSpaceAccess,
     Json(payload): Json<CreateSpaceRequest>,
 ) -> Result<(StatusCode, Json<Space>), AuthError> {
+    let is_system_admin = matches!(
+        actor.system_role,
+        SystemRole::SuperAdmin | SystemRole::Admin
+    );
+    if !is_system_admin {
+        let has_space_admin: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM space_members WHERE user_id = $1 AND space_role = 'space_admin' LIMIT 1",
+        )
+        .bind(actor.user_id)
+        .fetch_optional(&state.db)
+        .await?;
+        if has_space_admin.is_none() {
+            return Err(AuthError::Forbidden {
+                required: "admin or super_admin",
+            });
+        }
+    }
+
     let slug = payload
         .slug
         .trim()
@@ -50,34 +68,51 @@ pub async fn create_space(
     .bind(payload.name.trim())
     .bind(&payload.description)
     .bind(&payload.icon)
-    .bind(super_admin.user_id)
+    .bind(actor.user_id)
     .fetch_one(&mut *tx)
     .await?;
 
-    // Assign SuperAdmin and all requested Admin managers as SpaceAdmin
+    // Automatically insert the creator into `space_members` as `space_admin` so they immediately have full Admin access
     sqlx::query(
         r#"
         INSERT INTO space_members (space_id, user_id, space_role, granted_by)
         VALUES ($1, $2, 'space_admin', $2)
-        ON CONFLICT (space_id, user_id) DO NOTHING
+        ON CONFLICT (space_id, user_id)
+        DO UPDATE SET space_role = 'space_admin', granted_by = EXCLUDED.granted_by
         "#,
     )
     .bind(space.id)
-    .bind(super_admin.user_id)
+    .bind(actor.user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Also ensure all global SuperAdmins are enrolled as `space_admin` on the new Space
+    sqlx::query(
+        r#"
+        INSERT INTO space_members (space_id, user_id, space_role, granted_by)
+        SELECT $1, id, 'space_admin', $2 FROM users WHERE system_role = 'super_admin'
+        ON CONFLICT (space_id, user_id)
+        DO UPDATE SET space_role = 'space_admin'
+        "#,
+    )
+    .bind(space.id)
+    .bind(actor.user_id)
     .execute(&mut *tx)
     .await?;
 
     for manager_id in &payload.admin_manager_ids {
-        sqlx::query(
-            r#"
-            UPDATE users
-            SET system_role = 'admin'
-            WHERE id = $1 AND system_role = 'user'
-            "#,
-        )
-        .bind(manager_id)
-        .execute(&mut *tx)
-        .await?;
+        if actor.system_role == SystemRole::SuperAdmin {
+            sqlx::query(
+                r#"
+                UPDATE users
+                SET system_role = 'admin'
+                WHERE id = $1 AND system_role = 'user'
+                "#,
+            )
+            .bind(manager_id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -89,16 +124,18 @@ pub async fn create_space(
         )
         .bind(space.id)
         .bind(manager_id)
-        .bind(super_admin.user_id)
+        .bind(actor.user_id)
         .execute(&mut *tx)
         .await?;
     }
 
     tx.commit().await?;
 
+    state.cache.invalidate_space(&space.id);
+
     record_audit_log(
         &state.db,
-        super_admin.user_id,
+        actor.user_id,
         Some(space.id),
         None,
         "space.create",
